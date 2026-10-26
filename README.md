@@ -4,11 +4,11 @@ A standalone repository testing whether source-built ARM64 CEF can continue
 across free GitHub Actions Mac runners. This folder contains build recipes only:
 no Void browser source, profiles, signing keys, or Windows binaries.
 
-**Current state:** published at `xptea/mac_cef`; runner inspection and all seven
-initial checks passed on macOS. The first checkpoint attempt exposed a missing
-depot_tools Python bootstrap before compilation. Preparation now initializes and
-checks that pinned runtime before downloading CEF/Chromium. Actual cross-runner
-CEF reuse is not yet proven.
+**Current state:** published at `xptea/mac_cef`. A real 20-minute CEF compile
+produced 11,341 completed outputs; its 0.266 GiB checkpoint saved and downloaded
+successfully on a fresh runner. Verification stopped at a differing runner-image
+label. Image labels are now informational; actual toolchain and build inputs must
+still match. Zero-recompile reuse and a complete engine build remain unproven.
 
 ## First run: inspect
 
@@ -56,7 +56,9 @@ The proof requires 75 GiB free before source setup and stops below 8 GiB free.
 
 A fresh VM reconstructs the same pinned inputs at the same build path and checks:
 
-- runner image, Python, Xcode/SDK, compiler, source pins and GN settings match;
+- Python, Xcode/SDK, compiler, source pins and GN settings match;
+- runner-image labels are recorded, and may differ only while all real input
+  checks below still pass;
 - completed files and their nanosecond timestamps survived;
 - dependencies match in contents and timestamps;
 - Ninja's dry-run schedules **zero rebuild commands for sampled completed C++
@@ -82,7 +84,7 @@ Jobs have a 330-minute cap, below GitHub's six-hour limit. This is a bounded pro
 not an eleven-hour build or an automatic full-build chain. A full pipeline must
 reserve checkpoint time and finish the final link in one job.
 
-The script rejects changed images/toolchains. Source timestamps are normalized
+The script rejects changed toolchains and records image changes. Source timestamps are normalized
 only for identical pinned inputs; dependency hashes independently check contents
 before accepting reuse.
 

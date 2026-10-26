@@ -93,9 +93,13 @@ def samples_for(outputs, limit=100, minimum=10):
 
 
 def check_identity(saved, current):
-    if saved != current:
-        changed = [k for k in set(saved) | set(current) if saved.get(k) != current.get(k)]
+    # GitHub may roll out multiple images behind the same runner label. The
+    # actual pinned toolchain must match; image metadata alone is not an input.
+    changed = [k for k in set(saved) | set(current)
+               if k != "runner_image" and saved.get(k) != current.get(k)]
+    if changed:
         raise RuntimeError("Runner/toolchain/pin identity changed: " + ", ".join(sorted(changed)))
+    return saved.get("runner_image") != current.get("runner_image")
 
 
 def verify_files(root, records):
@@ -413,11 +417,14 @@ class Probe:
         checkpoint = read_json(self.root / "checkpoint.json")
         if checkpoint["schema"] != 1 or checkpoint["out_relative"] != self.out.relative_to(self.root).as_posix():
             raise RuntimeError("Unexpected checkpoint layout.")
-        check_identity(checkpoint["identity"], current)
+        image_changed = check_identity(checkpoint["identity"], current)
         verify_outputs(self.out, checkpoint["outputs"])
         verify_files(self.root, checkpoint["dependencies"])
         require_clean_targets(self.ninja(), self.out, checkpoint["samples"], self.root / "restored-dry-run.log")
-        report = {"result": "PASS", "completed_outputs_preserved": len(checkpoint["outputs"]),
+        report = {"result": "PASS", "runner_image_changed": image_changed,
+                  "saved_runner_image": checkpoint["identity"].get("runner_image"),
+                  "restored_runner_image": current.get("runner_image"),
+                  "completed_outputs_preserved": len(checkpoint["outputs"]),
                   "sampled_cpp_objects_requiring_recompile": 0, "sampled_cpp_objects": len(checkpoint["samples"]),
                   "verified_dependencies": len(checkpoint["dependencies"]),
                   "checkpoint_gib": round(self.archive.stat().st_size/GIB, 3),

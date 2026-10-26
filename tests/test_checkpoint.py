@@ -42,6 +42,26 @@ class CheckpointTests(ScratchCase):
             proof.check_identity({"sdk": "26.5", "cef_commit": "same"},
                                  {"sdk": "26.6", "cef_commit": "same"})
 
+    def test_image_rollout_does_not_reject_identical_toolchain(self):
+        identity = {"sdk": "26.5", "clang_version": "pinned clang", "cef_commit": "same",
+                    "runner_image": "old-image"}
+        restored = {**identity, "runner_image": "new-image"}
+        self.assertTrue(proof.check_identity(identity, restored))
+        self.assertFalse(proof.check_identity(identity, identity))
+        self.assertEqual(identity["runner_image"], "old-image")
+
+    def test_image_rollout_still_rejects_changed_build_inputs(self):
+        identity = {"sdk": "26.5", "clang_version": "pinned clang", "cef_commit": "same",
+                    "recipe_sha256": "same recipe", "gn_args": {"proprietary_codecs": True},
+                    "runner_image": "old-image"}
+        for key, value in [("sdk", "different sdk"), ("clang_version", "different compiler"),
+                           ("cef_commit", "different source"), ("recipe_sha256", "different recipe"),
+                           ("gn_args", {"proprietary_codecs": False})]:
+            with self.subTest(key=key):
+                restored = {**identity, "runner_image": "new-image", key: value}
+                with self.assertRaisesRegex(RuntimeError, key):
+                    proof.check_identity(identity, restored)
+
     def test_output_timestamp_loss_is_rejected(self):
         out = self.root / "out"
         out.mkdir()
