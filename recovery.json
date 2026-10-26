@@ -1,0 +1,9 @@
+{
+  "key": "cef-proof-v1-40387927781-1",
+  "sha256": "b813b11b0817e1bff134fd723e3edb438a7432a98c9615e1675ac99da3e3fd3b",
+  "recipe_sha256": "f217454dc5040085ea872554120b611935be88b186806cc2615553e8a03c0d05",
+  "source_commit": "b9dbb87e3f512faa110dc402f8cdc75b374f7908",
+  "source_run": "https://github.com/xptea/mac_cef/actions/runs/40387927781",
+  "completed_outputs": 11447,
+  "reason": "Recover the exact compiled checkpoint after fixing source-directory timestamp normalization."
+}

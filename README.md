@@ -4,11 +4,12 @@ A standalone repository testing whether source-built ARM64 CEF can continue
 across free GitHub Actions Mac runners. This folder contains build recipes only:
 no Void browser source, profiles, signing keys, or Windows binaries.
 
-**Current state:** published at `xptea/mac_cef`. A real 20-minute CEF compile
-produced 11,341 completed outputs; its 0.266 GiB checkpoint saved and downloaded
-successfully on a fresh runner. Verification stopped at a differing runner-image
-label. Image labels are now informational; actual toolchain and build inputs must
-still match. Zero-recompile reuse and a complete engine build remain unproven.
+**Current state:** the latest 20-minute CEF compile produced **11,447 completed
+outputs** in a **275 MiB** cached checkpoint. File/toolchain validation passed on a
+fresh runner, but Ninja requested GN regeneration because recreated source
+folders had newer timestamps. Preparation now normalizes directory timestamps as
+well as file timestamps. Cross-runner reuse still needs a passing recovery run;
+a complete engine build and final link remain unproven.
 
 ## First run: inspect
 
@@ -72,6 +73,24 @@ This tests real Ninja outputs without sccache. A partial checkpoint fitting does
 not prove a full checkpoint fits or the final link finishes on the free runner.
 Those measurements follow the first proof.
 
+## Recover the existing compiled checkpoint
+
+Run the workflow with **mode = recover**. It prepares fresh pinned source, restores
+only the cache approved in `recovery.json`, and runs the no-recompilation proof.
+It does **not** run another compilation batch, save over, or delete the old cache.
+Source reconstruction still takes time because GitHub discards completed VMs.
+
+The recovery manifest pins the exact cache key, archive SHA-256 and older recipe
+SHA-256 from the previous trusted run. Only that approved recipe is accepted for
+this migration; SDK/compiler/source/GN identity, dependency content and timestamp
+checks, output preservation and Ninja checks remain required. Other recipe
+changes are still rejected. Normal checkpoint mode retains the current-recipe
+match requirement.
+
+A failed verification does not delete Actions caches. GitHub may evict unused
+caches according to its retention/storage rules, so their presence is checked
+before recovery rather than assumed permanently.
+
 ## Limits and costs
 
 Standard hosted runner compute is free for public repositories. This recipe uses
@@ -84,7 +103,7 @@ Jobs have a 330-minute cap, below GitHub's six-hour limit. This is a bounded pro
 not an eleven-hour build or an automatic full-build chain. A full pipeline must
 reserve checkpoint time and finish the final link in one job.
 
-The script rejects changed toolchains and records image changes. Source timestamps are normalized
+The script rejects changed toolchains and records image changes. Source file and directory timestamps are normalized
 only for identical pinned inputs; dependency hashes independently check contents
 before accepting reuse.
 

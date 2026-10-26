@@ -56,17 +56,25 @@ def summary(title, value):
 
 
 def normalize_sources(src):
-    """Identical pinned inputs get stable mtimes; cached generated outputs keep theirs."""
+    """Stable file AND directory mtimes; leave cached build outputs untouched."""
     count = 0
+    folders = []
     for folder, dirs, files in os.walk(src, followlinks=False):
+        folder = Path(folder)
+        folders.append(folder)
         dirs[:] = [v for v in dirs if v not in (".git", "__pycache__")
-                   and not (v == "out" and Path(folder) == src)]
+                   and not (v == "out" and folder == src)
+                   and not (folder / v).is_symlink()]
         for name in files:
-            path = Path(folder) / name
+            path = folder / name
             if path.is_symlink() or path.suffix == ".pyc":
                 continue
             os.utime(path, ns=(SOURCE_TIME_NS, SOURCE_TIME_NS))
             count += 1
+    # GN tracks directory listings as inputs too. Set parents last so filesystem
+    # traversal or changes to children cannot leave a newer manifest dependency.
+    for folder in reversed(folders):
+        os.utime(folder, ns=(SOURCE_TIME_NS, SOURCE_TIME_NS))
     return count
 
 
@@ -92,11 +100,16 @@ def samples_for(outputs, limit=100, minimum=10):
     return [objects[i * (len(objects) - 1) // (limit - 1)] for i in range(limit)]
 
 
-def check_identity(saved, current):
+def check_identity(saved, current, compatible_recipe_sha256=None):
     # GitHub may roll out multiple images behind the same runner label. The
     # actual pinned toolchain must match; image metadata alone is not an input.
-    changed = [k for k in set(saved) | set(current)
-               if k != "runner_image" and saved.get(k) != current.get(k)]
+    compared = dict(saved)
+    # Explicit recovery of the checksum-pinned checkpoint from the previous
+    # recipe. Never waive compiler, SDK, source, flags, dependency or Ninja checks.
+    if compatible_recipe_sha256 and saved.get("recipe_sha256") == compatible_recipe_sha256:
+        compared["recipe_sha256"] = current.get("recipe_sha256")
+    changed = [k for k in set(compared) | set(current)
+               if k != "runner_image" and compared.get(k) != current.get(k)]
     if changed:
         raise RuntimeError("Runner/toolchain/pin identity changed: " + ", ".join(sorted(changed)))
     return saved.get("runner_image") != current.get("runner_image")
@@ -409,7 +422,9 @@ class Probe:
             "full_build_fit": "Not established by this partial sample.",
         })
 
-    def verify(self, expected):
+    def verify(self, expected, recovery=None):
+        if recovery is not None and expected != recovery["sha256"]:
+            raise RuntimeError("Recovery checksum differs from the approved checkpoint.")
         current = read_json(self.root / "identity.json")
         if not re.fullmatch(r"[0-9a-f]{64}", expected) or digest(self.archive) != expected:
             raise RuntimeError("Downloaded checkpoint checksum mismatch.")
@@ -417,11 +432,17 @@ class Probe:
         checkpoint = read_json(self.root / "checkpoint.json")
         if checkpoint["schema"] != 1 or checkpoint["out_relative"] != self.out.relative_to(self.root).as_posix():
             raise RuntimeError("Unexpected checkpoint layout.")
-        image_changed = check_identity(checkpoint["identity"], current)
+        compatible_recipe = None
+        if recovery is not None:
+            compatible_recipe = recovery["recipe_sha256"]
+            if checkpoint["identity"].get("recipe_sha256") != compatible_recipe:
+                raise RuntimeError("Recovery recipe differs from the approved checkpoint.")
+        image_changed = check_identity(checkpoint["identity"], current, compatible_recipe)
         verify_outputs(self.out, checkpoint["outputs"])
         verify_files(self.root, checkpoint["dependencies"])
         require_clean_targets(self.ninja(), self.out, checkpoint["samples"], self.root / "restored-dry-run.log")
-        report = {"result": "PASS", "runner_image_changed": image_changed,
+        report = {"result": "PASS", "recovered_existing_checkpoint": recovery is not None,
+                  "runner_image_changed": image_changed,
                   "saved_runner_image": checkpoint["identity"].get("runner_image"),
                   "restored_runner_image": current.get("runner_image"),
                   "completed_outputs_preserved": len(checkpoint["outputs"]),
@@ -440,6 +461,8 @@ def main():
     parser.add_argument("--reclaim-unused-xcodes", action="store_true")
     parser.add_argument("--seconds", type=int, default=1200)
     parser.add_argument("--expected-sha256", default="")
+    parser.add_argument("--recover-existing", action="store_true",
+                        help="Verify the exact checkpoint approved in recovery.json; never compiles.")
     args = parser.parse_args()
     probe = Probe(args.root)
     probe.mac_only()
@@ -452,7 +475,8 @@ def main():
     elif args.action == "save":
         probe.save()
     else:
-        probe.verify(args.expected_sha256)
+        recovery = read_json(REPO / "recovery.json") if args.recover_existing else None
+        probe.verify(args.expected_sha256, recovery)
 
 
 if __name__ == "__main__":

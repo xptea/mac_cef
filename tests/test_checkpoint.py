@@ -62,6 +62,42 @@ class CheckpointTests(ScratchCase):
                 with self.assertRaisesRegex(RuntimeError, key):
                     proof.check_identity(identity, restored)
 
+    def test_normalization_preserves_cached_output_and_git_timestamps(self):
+        src = self.root / "src"
+        templates = src / "components/policy/resources/templates"
+        templates.mkdir(parents=True)
+        (templates / "policy.json").write_text("{}")
+        excluded = []
+        for relative in ["out/Release_GN_arm64", ".git", "__pycache__"]:
+            folder = src / relative
+            folder.mkdir(parents=True)
+            target = folder / "retained"
+            target.write_text("cached metadata")
+            excluded.extend([folder, target])
+        before = {p: p.stat().st_mtime_ns for p in excluded}
+        proof.normalize_sources(src)
+        for folder in [src, templates, templates.parent, templates.parent.parent]:
+            self.assertEqual(folder.stat().st_mtime_ns, proof.SOURCE_TIME_NS)
+        self.assertEqual({p: p.stat().st_mtime_ns for p in excluded}, before)
+
+    def test_approved_old_recipe_keeps_all_real_identity_checks(self):
+        old = {"recipe_sha256": "approved old recipe", "sdk": "same sdk", "runner_image": "old"}
+        current = {**old, "recipe_sha256": "current recipe", "runner_image": "new"}
+        with self.assertRaisesRegex(RuntimeError, "recipe_sha256"):
+            proof.check_identity(old, current)
+        self.assertTrue(proof.check_identity(old, current, "approved old recipe"))
+        with self.assertRaisesRegex(RuntimeError, "sdk"):
+            proof.check_identity(old, {**current, "sdk": "changed sdk"}, "approved old recipe")
+        with self.assertRaisesRegex(RuntimeError, "recipe_sha256"):
+            proof.check_identity(old, current, "different old recipe")
+
+    def test_recovery_rejects_unapproved_checksum_before_extracting(self):
+        probe = proof.Probe.__new__(proof.Probe)
+        with mock.patch.object(proof, "extract_archive") as extract:
+            with self.assertRaisesRegex(RuntimeError, "Recovery checksum"):
+                probe.verify("other checksum", {"sha256": "approved checkpoint"})
+            extract.assert_not_called()
+
     def test_output_timestamp_loss_is_rejected(self):
         out = self.root / "out"
         out.mkdir()
@@ -188,6 +224,30 @@ class RealNinjaTests(ScratchCase):
         self.assertEqual((self.src / "calls.txt").read_text(), calls)
         remaining = proof.capture([self.ninja, "-C", self.out, "-n", "-v", "obj/unit4.o"])
         self.assertIn("unit4.cc", remaining)
+
+    def test_fresh_directory_timestamp_requests_regeneration_then_fix_preserves_objects(self):
+        templates = self.src / "components/policy/resources/templates"
+        templates.mkdir(parents=True)
+        (templates / "policy.json").write_text("{}")
+        manifest = self.out / "build.ninja"
+        manifest.write_text(manifest.read_text() +
+                            "\nrule regen\n"
+                            '  command = "' + sys.executable.replace("\\", "/") + '" -c "pass"\n'
+                            "  description = Regenerating ninja files\n"
+                            "  generator = 1\n"
+                            "build build.ninja.stamp: regen ../../components/policy/resources/templates\n"
+                            "build build.ninja: phony build.ninja.stamp\n")
+        (self.out / "build.ninja.stamp").write_text("saved GN generation")
+        outputs = proof.ninja_outputs(self.out)
+        calls = (self.src / "calls.txt").read_text()
+        future = time.time_ns() + 10_000_000_000
+        os.utime(templates, ns=(future, future))
+        with self.assertRaisesRegex(RuntimeError, "Regenerating ninja files"):
+            proof.require_clean_targets(self.ninja, self.out, self.built, self.root / "directory-dirty.log")
+        proof.normalize_sources(self.src)
+        proof.require_clean_targets(self.ninja, self.out, self.built, self.root / "directory-restored.log")
+        proof.verify_outputs(self.out, outputs)
+        self.assertEqual((self.src / "calls.txt").read_text(), calls)
 
     def test_fresh_input_timestamps_make_ninja_reject_reuse(self):
         source = self.src / "unit0.cc"

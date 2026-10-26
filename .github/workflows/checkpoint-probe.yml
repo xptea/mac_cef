@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Inspect first; checkpoint downloads and partially compiles CEF.
+        description: Inspect, make a checkpoint, or recover the approved existing checkpoint.
         type: choice
         options:
           - inspect
           - checkpoint
+          - recover
         default: inspect
       compile_seconds:
         description: Compilation seconds (60-3600), excluding source setup.
@@ -114,3 +115,46 @@ jobs:
           EXPECTED_CHECKPOINT_SHA256: ${{ needs.save.outputs.checkpoint_sha256 }}
         run: python3 scripts/checkpoint.py verify --expected-sha256 "$EXPECTED_CHECKPOINT_SHA256"
 
+
+  recover:
+    name: Recover saved compiled work without another compile
+    if: ${{ inputs.mode == 'recover' }}
+    needs: inspect
+    runs-on: macos-26
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Load the approved checkpoint identity
+        id: recovery
+        run: |
+          python3 - <<'PY'
+          import json, os
+          with open('recovery.json') as stream:
+              recovery = json.load(stream)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write('key=' + recovery['key'] + '\n')
+              stream.write('sha256=' + recovery['sha256'] + '\n')
+          PY
+      - name: Recreate pinned source with stable file and directory timestamps
+        env:
+          RECLAIM_UNUSED_XCODES: ${{ inputs.reclaim_unused_xcodes }}
+        run: |
+          flags=()
+          if [ "$RECLAIM_UNUSED_XCODES" = "true" ]; then flags+=(--reclaim-unused-xcodes); fi
+          python3 scripts/checkpoint.py prepare "${flags[@]}"
+      - name: Restore the preserved compiled checkpoint
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/cef-checkpoint/checkpoint.tar.zst
+          key: ${{ steps.recovery.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Verify the preserved work requires no recompilation
+        env:
+          EXPECTED_CHECKPOINT_SHA256: ${{ steps.recovery.outputs.sha256 }}
+        run: python3 scripts/checkpoint.py verify --recover-existing --expected-sha256 "$EXPECTED_CHECKPOINT_SHA256"
