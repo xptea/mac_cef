@@ -1,0 +1,116 @@
+name: CEF checkpoint proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Inspect first; checkpoint downloads and partially compiles CEF.
+        type: choice
+        options:
+          - inspect
+          - checkpoint
+        default: inspect
+      compile_seconds:
+        description: Compilation seconds (60-3600), excluding source setup.
+        type: number
+        default: 1200
+      reclaim_unused_xcodes:
+        description: Remove other Xcode installations on disposable runners only.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cef-checkpoint-proof
+  cancel-in-progress: false
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+jobs:
+  inspect:
+    name: Inspect free Apple Silicon runner
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Check the checkpoint logic
+        run: python3 -m unittest discover -s tests -v
+      - name: Report actual hardware, disk and SDK
+        run: python3 scripts/checkpoint.py inspect
+
+  save:
+    name: Compile a bounded CEF batch and save it
+    if: ${{ inputs.mode == 'checkpoint' }}
+    needs: inspect
+    runs-on: macos-26
+    timeout-minutes: 330
+    outputs:
+      checkpoint_sha256: ${{ steps.snapshot.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Prepare shallow pinned source and identical build paths
+        env:
+          RECLAIM_UNUSED_XCODES: ${{ inputs.reclaim_unused_xcodes }}
+        run: |
+          flags=()
+          if [ "$RECLAIM_UNUSED_XCODES" = "true" ]; then flags+=(--reclaim-unused-xcodes); fi
+          python3 scripts/checkpoint.py prepare "${flags[@]}"
+      - name: Compile for the limited test window
+        env:
+          COMPILE_SECONDS: ${{ inputs.compile_seconds }}
+        run: python3 scripts/checkpoint.py compile --seconds "$COMPILE_SECONDS"
+      - name: Compress, hash and size-check completed work
+        id: snapshot
+        run: python3 scripts/checkpoint.py save
+      - name: Save the compressed checkpoint
+        uses: actions/cache/save@v5
+        with:
+          path: ~/cef-checkpoint/checkpoint.tar.zst
+          key: cef-proof-v1-${{ github.run_id }}-${{ github.run_attempt }}
+
+  restore:
+    name: Prove reuse on a fresh Mac runner
+    needs: save
+    runs-on: macos-26
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Recreate the same pinned inputs on a fresh runner
+        env:
+          RECLAIM_UNUSED_XCODES: ${{ inputs.reclaim_unused_xcodes }}
+        run: |
+          flags=()
+          if [ "$RECLAIM_UNUSED_XCODES" = "true" ]; then flags+=(--reclaim-unused-xcodes); fi
+          python3 scripts/checkpoint.py prepare "${flags[@]}"
+      - name: Restore the exact checkpoint from the preceding job
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/cef-checkpoint/checkpoint.tar.zst
+          key: cef-proof-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+      - name: Verify hashes, timestamps, toolchain and no recompilation
+        env:
+          EXPECTED_CHECKPOINT_SHA256: ${{ needs.save.outputs.checkpoint_sha256 }}
+        run: python3 scripts/checkpoint.py verify --expected-sha256 "$EXPECTED_CHECKPOINT_SHA256"
+

@@ -1,0 +1,27 @@
+{
+  "cef_version": "156.0.14+g4fa4ab5+chromium-156.0.8078.48",
+  "cef_commit": "4fa4ab516dacf6c49fc7e6e70d2b7ebce29fa35f",
+  "chromium_commit": "d0c02bfad08ec92a6ffcf989e53cd995e6381a4c",
+  "depot_tools_commit": "faceefec3fab70643e950caad40fded806877988",
+  "automate_sha256": "94d3ddd1e0d35482132f45dc101a593c9371b6eb2d8ff4af6cfe2734d2e48c6a",
+  "branch": "8078",
+  "developer_dir": "/Applications/Xcode_26.6.app/Contents/Developer",
+  "sdk_version": "26.5",
+  "jobs": 2,
+  "minimum_prepare_free_gib": 75,
+  "minimum_runtime_free_gib": 8,
+  "max_checkpoint_gib": 8,
+  "gn_args": {
+    "is_official_build": true,
+    "is_component_build": false,
+    "proprietary_codecs": true,
+    "ffmpeg_branding": "Chrome",
+    "enable_widevine": true,
+    "symbol_level": 0,
+    "use_siso": false,
+    "use_remoteexec": false,
+    "target_cpu": "arm64",
+    "use_system_xcode": true
+  }
+}
+
