@@ -4,8 +4,11 @@ A standalone repository testing whether source-built ARM64 CEF can continue
 across free GitHub Actions Mac runners. This folder contains build recipes only:
 no Void browser source, profiles, signing keys, or Windows binaries.
 
-**Current state:** prepared locally. No public repository or Mac workflow run has
-been created or started. Actual cross-runner CEF reuse is not yet proven.
+**Current state:** published at `xptea/mac_cef`; runner inspection and all seven
+initial checks passed on macOS. The first checkpoint attempt exposed a missing
+depot_tools Python bootstrap before compilation. Preparation now initializes and
+checks that pinned runtime before downloading CEF/Chromium. Actual cross-runner
+CEF reuse is not yet proven.
 
 ## First run: inspect
 
@@ -37,6 +40,8 @@ The proof requires 75 GiB free before source setup and stops below 8 GiB free.
 ### Save job
 
 - Fetch exact CEF, Chromium and depot_tools revisions, with shallow Chromium history.
+- Bootstrap the pinned depot_tools runtime without updating its checkout; verify
+  its Python interpreter starts before source setup.
 - Configure the native codec-enabled, noncomponent ARM64 engine.
 - Compile the actual cefclient/CEF graph with two parallel jobs for the bounded
   test window, then interrupt Ninja gracefully.

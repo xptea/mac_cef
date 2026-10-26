@@ -169,7 +169,8 @@ class Probe:
         self.depot = self.root / "tools/depot_tools"
         self.archive = self.root / "checkpoint.tar.zst"
         self.env = dict(os.environ)
-        self.env.update(DEPOT_TOOLS_UPDATE="0", CEF_ENABLE_ARM64="1", PYTHONUNBUFFERED="1",
+        self.env.update(DEPOT_TOOLS_UPDATE="0", DEPOT_TOOLS_BOOTSTRAP_PYTHON3="1",
+                        CEF_ENABLE_ARM64="1", PYTHONUNBUFFERED="1",
                         DEVELOPER_DIR=self.config["developer_dir"])
         self.env["PATH"] = str(self.depot) + os.pathsep + self.env["PATH"]
         self.gn = dict(self.config["gn_args"])
@@ -271,6 +272,20 @@ class Probe:
             raise RuntimeError(f"{label} failed ({process.returncode}):\n" + log.read_text(errors="replace")[-12000:])
         return {"elapsed_seconds": round(time.monotonic()-started, 1), "bounded_stop": timed_out}
 
+    def bootstrap_depot(self):
+        # Disabling depot_tools updates also suppresses gclient's automatic
+        # bootstrap. Initialize the pinned checkout without updating its source.
+        self.run(["/bin/bash", self.depot / "ensure_bootstrap"],
+                 "depot-bootstrap", timeout=900)
+        if not (self.depot / "python3_bin_reldir.txt").is_file():
+            raise RuntimeError("depot_tools bootstrap did not initialize its Python runtime; inspect depot-bootstrap.log")
+        version = capture(["/bin/bash", self.depot / "python-bin/python3", "--version"], env=self.env)
+        if not version.startswith("Python 3."):
+            raise RuntimeError("Unexpected depot_tools Python runtime: " + version)
+        if capture(["git", "-C", self.depot, "rev-parse", "HEAD"]) != self.config["depot_tools_commit"]:
+            raise RuntimeError("depot_tools revision changed during bootstrap.")
+        print("Pinned depot_tools initialized: " + version, flush=True)
+
     def prepare(self, reclaim=False):
         data = self.inspect()
         if reclaim:
@@ -301,6 +316,7 @@ class Probe:
             self.run(["git", "-C", self.depot, "checkout", "--detach", "FETCH_HEAD"], "depot-checkout", timeout=60)
         if capture(["git", "-C", self.depot, "rev-parse", "HEAD"]) != self.config["depot_tools_commit"]:
             raise RuntimeError("Unexpected depot_tools revision.")
+        self.bootstrap_depot()
         self.run([sys.executable, automate, f"--download-dir={self.root / 'work'}",
                   f"--depot-tools-dir={self.depot}", f"--branch={self.config['branch']}",
                   f"--checkout={self.config['cef_commit']}", "--arm64-build", "--with-pgo-profiles",

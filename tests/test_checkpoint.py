@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import checkpoint as proof
@@ -71,6 +72,45 @@ class CheckpointTests(ScratchCase):
         proof.extract_archive(self.root, archive)
         self.assertEqual(target.read_bytes(), b"dependency metadata")
         self.assertEqual(target.stat().st_mtime_ns, stamp)
+
+
+class DepotBootstrapTests(ScratchCase):
+    def setUp(self):
+        super().setUp()
+        self.probe = proof.Probe.__new__(proof.Probe)
+        self.probe.depot = self.root / "depot_tools"
+        self.probe.depot.mkdir()
+        self.probe.env = {"DEPOT_TOOLS_UPDATE": "0", "DEPOT_TOOLS_BOOTSTRAP_PYTHON3": "1"}
+        self.probe.config = {"depot_tools_commit": "pinned-revision"}
+        self.probe.run = mock.Mock()
+
+    def initialized(self):
+        (self.probe.depot / "python3_bin_reldir.txt").write_text("bootstrap/python3/bin")
+
+    def test_missing_python_bootstrap_is_rejected_before_source_setup(self):
+        with mock.patch.object(proof, "capture") as capture:
+            with self.assertRaisesRegex(RuntimeError, "did not initialize its Python runtime"):
+                self.probe.bootstrap_depot()
+            capture.assert_not_called()
+
+    def test_broken_bootstrapped_python_is_rejected(self):
+        self.initialized()
+        with mock.patch.object(proof, "capture", side_effect=RuntimeError("Python cannot start")):
+            with self.assertRaisesRegex(RuntimeError, "Python cannot start"):
+                self.probe.bootstrap_depot()
+
+    def test_bootstrap_preserves_the_pinned_checkout(self):
+        self.probe.run.side_effect = lambda *args, **kwargs: self.initialized()
+        with mock.patch.object(proof, "capture", side_effect=["Python 3.11.9", "pinned-revision"]):
+            self.probe.bootstrap_depot()
+        self.probe.run.assert_called_once_with(
+            ["/bin/bash", self.probe.depot / "ensure_bootstrap"], "depot-bootstrap", timeout=900)
+
+    def test_changed_checkout_is_rejected_after_bootstrap(self):
+        self.initialized()
+        with mock.patch.object(proof, "capture", side_effect=["Python 3.11.9", "changed-revision"]):
+            with self.assertRaisesRegex(RuntimeError, "revision changed"):
+                self.probe.bootstrap_depot()
 
 
 class RealNinjaTests(ScratchCase):
