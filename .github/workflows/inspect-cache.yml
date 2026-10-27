@@ -1,0 +1,32 @@
+name: Inspect existing CEF cache
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+jobs:
+  inspect:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Load saved checkpoint key
+        id: checkpoint
+        run: |
+          python3 - <<'PY'
+          import json, os
+          with open('recovery.json') as stream:
+              recovery=json.load(stream)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write('key=' + recovery['key'] + '\n')
+          PY
+      - uses: actions/cache/restore@v5
+        with:
+          path: ~/cef-checkpoint/checkpoint.tar.zst
+          key: ${{ steps.checkpoint.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Check preserved data without source download or diagnostic upload
+        run: python3 scripts/inspect_saved.py
