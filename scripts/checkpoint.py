@@ -124,11 +124,83 @@ def verify_files(root, records):
             raise RuntimeError("Dependency timestamp changed: " + str(path))
 
 
-def verify_outputs(out, records):
+def verify_outputs(out, records, sdk_root=None):
+    aliases = 0
     for name, expected in records.items():
         path = out / name
+        resolved = path.resolve()
+        if (sdk_root is not None and name.startswith("sdk/xcode_links/")
+                and not resolved.is_relative_to(out.resolve())):
+            if not resolved.is_relative_to(sdk_root.resolve()) or not path.is_file():
+                raise RuntimeError("Invalid installed SDK alias: " + name)
+            aliases += 1
+            continue
         if not path.is_file() or path.stat().st_size != expected["size"] or path.stat().st_mtime_ns != expected["mtime_ns"]:
-            raise RuntimeError("Output or nanosecond timestamp was not preserved: " + name)
+            actual = path.stat() if path.is_file() else None
+            details = {"exists": actual is not None,
+                       "size_matches": actual is not None and actual.st_size == expected["size"],
+                       "timestamp_matches": actual is not None and actual.st_mtime_ns == expected["mtime_ns"]}
+            raise RuntimeError("Output or nanosecond timestamp was not preserved: " + name + " " + json.dumps(details))
+    return aliases
+
+
+def restore_sdk_timestamps(root, records, sdk_root):
+    """Align identical SDK inputs on a disposable runner, never waive content checks."""
+    sdk_root = sdk_root.resolve()
+    changes = []
+    for record in records:
+        if record["base"] != "external":
+            continue
+        path = Path(record["path"]).resolve()
+        if not path.is_relative_to(sdk_root):
+            continue
+        if not path.is_file() or path.stat().st_size != record["size"] or digest(path) != record["sha256"]:
+            raise RuntimeError("Pinned SDK dependency content changed: " + path.name)
+        if path.stat().st_mtime_ns != record["mtime_ns"]:
+            changes.append({**record, "path": str(path)})
+    privileged = []
+    for record in changes:
+        try:
+            os.utime(record["path"], ns=(record["mtime_ns"], record["mtime_ns"]))
+        except PermissionError:
+            privileged.append(record)
+    if privileged:
+        if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
+            raise RuntimeError("SDK timestamp repair is restricted to disposable Mac Actions runners.")
+        request = root / "sdk-timestamps.json"
+        write_json(request, privileged)
+        code = "import hashlib,json,os,sys; from pathlib import Path\n" + \
+               "base=Path(sys.argv[2]).resolve()\n" + \
+               "for r in json.load(open(sys.argv[1])):\n" + \
+               " p=Path(r['path']).resolve(); p.relative_to(base)\n" + \
+               " assert p.stat().st_size==r['size'] and hashlib.sha256(p.read_bytes()).hexdigest()==r['sha256']\n" + \
+               " os.utime(p,ns=(r['mtime_ns'],r['mtime_ns']))\n"
+        capture(["sudo", "-n", "/usr/bin/python3", "-c", code, request, sdk_root])
+    return len(changes)
+
+
+def pack_chromium_metadata(src):
+    """Cache commit/tree metadata without duplicating the checked-out blob content."""
+    pack = src / ".git/cef-source-metadata.pack"
+    with pack.open("wb") as output:
+        result = subprocess.run(["git", "-C", str(src), "pack-objects", "--stdout", "--revs", "--filter=blob:none"],
+                                input=b"HEAD\n", stdout=output, stderr=subprocess.PIPE, timeout=300)
+    if result.returncode:
+        raise RuntimeError("Cannot prepare source Git metadata: " + result.stderr.decode(errors="replace")[-4000:])
+
+
+def restore_chromium_metadata(src):
+    pack = src / ".git/cef-source-metadata.pack"
+    (src / ".git/objects").mkdir(parents=True, exist_ok=True)
+    capture(["git", "-C", src, "config", "core.repositoryformatversion", "1"])
+    capture(["git", "-C", src, "config", "extensions.partialClone", "origin"])
+    capture(["git", "-C", src, "config", "remote.origin.promisor", "true"])
+    capture(["git", "-C", src, "config", "remote.origin.partialclonefilter", "blob:none"])
+    with pack.open("rb") as source:
+        result = subprocess.run(["git", "-C", str(src), "index-pack", "--stdin", "--promisor"], stdin=source,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+    if result.returncode:
+        raise RuntimeError("Cannot restore source Git metadata: " + result.stdout.decode(errors="replace")[-4000:])
 
 
 def require_clean_targets(ninja, out, targets, log):
@@ -359,9 +431,9 @@ class Probe:
         identity = self.identity()
         identity.pop("runner_image")
         identity.pop("recipe_sha256")
-        encoded = json.dumps({"format": 1, "identity": identity,
+        encoded = json.dumps({"format": 2, "identity": identity,
                               "automate_sha256": self.config["automate_sha256"]}, sort_keys=True).encode()
-        return "cef-source-v1-" + hashlib.sha256(encoded).hexdigest()[:32]
+        return "cef-source-v2-" + hashlib.sha256(encoded).hexdigest()[:32]
 
     def restore_source(self):
         if not self.source_archive.is_file():
@@ -371,6 +443,7 @@ class Probe:
         if not re.fullmatch(r"[0-9a-f]{64}", checksum) or digest(self.source_archive) != checksum:
             raise RuntimeError("Prepared-source cache checksum mismatch.")
         extract_archive(self.root, self.source_archive)
+        restore_chromium_metadata(self.src)
         manifest = read_json(self.root / "source-cache.json")
         if manifest["key"] != self.source_key():
             raise RuntimeError("Prepared-source cache identity mismatch.")
@@ -380,6 +453,7 @@ class Probe:
     def save_source(self):
         if self.source_archive.is_file():
             return
+        pack_chromium_metadata(self.src)
         write_json(self.root / "source-cache.json", {"key": self.source_key()})
         self.source_archive.parent.mkdir(parents=True, exist_ok=True)
         # Keep source+tools inside the included repository cache budget. Existing
@@ -387,7 +461,7 @@ class Probe:
         try:
             make_archive(self.root, self.source_archive,
                          [".cef-checkpoint-probe", "source-cache.json", "tools", "work"],
-                         excludes=["work/chromium/src/out", "work/out_*"],
+                         excludes=["work/chromium/src/out", "work/out_*", "work/chromium/src/.git/objects"],
                          max_bytes=6 * GIB, timeout=1200)
         except ArchiveTooLarge:
             self.source_archive.unlink(missing_ok=True)
@@ -565,14 +639,17 @@ class Probe:
             if checkpoint["identity"].get("recipe_sha256") != compatible_recipe:
                 raise RuntimeError("Recovery recipe differs from the approved checkpoint.")
         image_changed = check_identity(checkpoint["identity"], current, compatible_recipe)
-        verify_outputs(self.out, checkpoint["outputs"])
+        sdk_root = Path(self.config["developer_dir"])
+        normalized_sdk_inputs = restore_sdk_timestamps(self.root, checkpoint["dependencies"], sdk_root)
+        sdk_aliases = verify_outputs(self.out, checkpoint["outputs"], sdk_root)
         verify_files(self.root, checkpoint["dependencies"])
         require_clean_targets(self.ninja(), self.out, checkpoint["samples"], self.root / "restored-dry-run.log")
         report = {"result": "PASS", "recovered_existing_checkpoint": recovery is not None,
                   "runner_image_changed": image_changed,
                   "saved_runner_image": checkpoint["identity"].get("runner_image"),
                   "restored_runner_image": current.get("runner_image"),
-                  "completed_outputs_preserved": len(checkpoint["outputs"]),
+                  "completed_outputs_preserved": len(checkpoint["outputs"])-sdk_aliases,
+                  "sdk_alias_outputs": sdk_aliases, "identical_sdk_inputs_retimestamped": normalized_sdk_inputs,
                   "sampled_cpp_objects_requiring_recompile": 0, "sampled_cpp_objects": len(checkpoint["samples"]),
                   "verified_dependencies": len(checkpoint["dependencies"]),
                   "checkpoint_gib": round(self.archive.stat().st_size/GIB, 3),

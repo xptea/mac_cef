@@ -153,3 +153,19 @@ Checkpoint restoration now clears only the generated output directory inside
 the dedicated runner build root before extraction. It does not overlay archived
 SDK trees on links created by fresh GN configuration, and does not remove the
 preserved archive or follow links into the installed SDK.
+
+### Source and SDK portability repair
+
+The first complete source snapshot exceeded 6 GiB because it duplicated the
+checked-out Chromium files inside Git object packs. Source-cache format v2 keeps
+the working files plus a filtered commit/tree metadata pack, omits only the main
+Chromium blob-object store, and rehydrates its Git metadata on restore. A missing
+historical blob can be fetched from the pinned public origin if Git later needs
+one; ordinary warm preparation still skips the full download/sync.
+
+Installed SDK aliases are classified as inputs, not compiler-owned cached output.
+Used SDK inputs still require the exact recorded SHA-256 content and pinned
+Xcode/SDK identity. For identical bytes only, their recorded timestamps are
+restored on the disposable Actions runner before checking Ninja. Compiled
+objects and generated files retain strict size/timestamp checks. SDK content
+changes, aliases outside the selected Xcode, and missing SDK files are rejected.

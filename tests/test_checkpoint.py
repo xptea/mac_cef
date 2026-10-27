@@ -143,6 +143,43 @@ class CheckpointTests(ScratchCase):
         self.assertIn("input.cc",members)
         self.assertNotIn("completed.o",members)
 
+    def test_sdk_timestamp_changes_require_identical_content(self):
+        sdk=self.root / "Xcode/Developer"
+        sdk.mkdir(parents=True)
+        header=sdk / "header.h"
+        header.write_text("identical SDK header")
+        record={"base":"external", "path":str(header), "size":header.stat().st_size,
+                "mtime_ns":proof.SOURCE_TIME_NS, "sha256":proof.digest(header)}
+        self.assertEqual(proof.restore_sdk_timestamps(self.root,[record],sdk),1)
+        proof.verify_files(self.root,[record])
+        header.write_text("different SDK header")
+        stamp=header.stat().st_mtime_ns
+        with self.assertRaisesRegex(RuntimeError,"SDK dependency content changed"):
+            proof.restore_sdk_timestamps(self.root,[record],sdk)
+        self.assertEqual(header.stat().st_mtime_ns,stamp)
+
+    def test_sdk_aliases_are_inputs_while_compiled_outputs_stay_strict(self):
+        sdk=self.root / "Xcode/Developer"
+        sdk.mkdir(parents=True)
+        (sdk / "header.h").write_text("installed header")
+        out=self.root / "out"
+        alias=out / "sdk/xcode_links/SDK"
+        alias.parent.mkdir(parents=True)
+        try:
+            alias.symlink_to(sdk,target_is_directory=True)
+        except OSError as error:
+            self.skipTest(str(error))
+        obj=out / "unit.o"
+        obj.write_bytes(b"object")
+        records={"sdk/xcode_links/SDK/header.h":{"size":0,"mtime_ns":0},
+                 "unit.o":{"size":obj.stat().st_size,"mtime_ns":obj.stat().st_mtime_ns}}
+        self.assertEqual(proof.verify_outputs(out,records,sdk),1)
+        obj.write_bytes(b"changed object")
+        with self.assertRaisesRegex(RuntimeError,"Output or nanosecond"):
+            proof.verify_outputs(out,records,sdk)
+        with self.assertRaisesRegex(RuntimeError,"Invalid installed SDK alias"):
+            proof.verify_outputs(out,records,self.root / "unrelated-sdk")
+
     def test_output_timestamp_loss_is_rejected(self):
         out = self.root / "out"
         out.mkdir()
@@ -226,6 +263,30 @@ class PreparedSourceTests(ScratchCase):
         self.assertEqual(probe.source_key(),key)
         probe.identity.return_value={**identity,"cef_commit":"different source"}
         self.assertNotEqual(probe.source_key(),key)
+
+    def test_filtered_source_git_cache_preserves_history_and_working_files(self):
+        if not shutil.which("git"):
+            self.skipTest("Git unavailable")
+        origin=self.root / "origin"
+        origin.mkdir()
+        proof.capture(["git","init",origin])
+        proof.capture(["git","-C",origin,"config","user.email","fixture@example.invalid"])
+        proof.capture(["git","-C",origin,"config","user.name","CEF cache fixture"])
+        (origin / "input.cc").write_text("source file\n"*1000)
+        proof.capture(["git","-C",origin,"add","input.cc"])
+        proof.capture(["git","-C",origin,"commit","-m","fixture"])
+        src=self.root / "checkout"
+        proof.capture(["git","clone","--no-hardlinks",origin,src])
+        expected=proof.capture(["git","-C",src,"rev-parse","HEAD"])
+        proof.pack_chromium_metadata(src)
+        restored=self.root / "restored"
+        shutil.copytree(src,restored,ignore=lambda folder,names: ["objects"] if Path(folder).name==".git" else [])
+        self.assertFalse((restored / ".git/objects").exists())
+        proof.restore_chromium_metadata(restored)
+        self.assertEqual(proof.capture(["git","-C",restored,"log","-1","--format=%H"]),expected)
+        self.assertEqual((restored / "input.cc").read_text(),(src / "input.cc").read_text())
+        (restored / "input.cc").write_text("changed after cache restore\n")
+        self.assertIn("changed after cache restore",proof.capture(["git","-C",restored,"diff"]))
 
     def test_bad_source_archive_checksum_is_rejected_before_extracting(self):
         probe=proof.Probe.__new__(proof.Probe)
@@ -359,6 +420,20 @@ class RealNinjaTests(ScratchCase):
         self.assertEqual(proof.remaining_steps(self.ninja,self.out,self.root / "remaining.log"), 1)
         proof.capture([self.ninja,"-C",self.out,"obj/unit4.o"])
         self.assertEqual(proof.remaining_steps(self.ninja,self.out,self.root / "done.log"), 0)
+
+    def test_identical_sdk_timestamp_repair_restores_real_ninja_reuse(self):
+        sdk=self.src
+        header=self.header
+        record={"base":"external","path":str(header),"size":header.stat().st_size,
+                "mtime_ns":header.stat().st_mtime_ns,"sha256":proof.digest(header)}
+        outputs=proof.ninja_outputs(self.out)
+        future=time.time_ns()+10_000_000_000
+        os.utime(header,ns=(future,future))
+        with self.assertRaisesRegex(RuntimeError,"would rebuild"):
+            proof.require_clean_targets(self.ninja,self.out,self.built,self.root / "sdk-dirty.log")
+        proof.restore_sdk_timestamps(self.root,[record],sdk)
+        proof.require_clean_targets(self.ninja,self.out,self.built,self.root / "sdk-restored.log")
+        proof.verify_outputs(self.out,outputs)
 
     def test_fresh_input_timestamps_make_ninja_reject_reuse(self):
         source = self.src / "unit0.cc"
