@@ -435,6 +435,46 @@ class RealNinjaTests(ScratchCase):
         proof.require_clean_targets(self.ninja,self.out,self.built,self.root / "sdk-restored.log")
         proof.verify_outputs(self.out,outputs)
 
+    def test_verified_angle_git_clock_restores_generator_without_recompiling(self):
+        angle = self.src / "third_party/angle"
+        angle.mkdir(parents=True)
+        proof.capture(["git", "init", angle])
+        (angle / "version.txt").write_text("pinned ANGLE source")
+        proof.capture(["git", "-C", angle, "add", "version.txt"])
+        proof.capture(["git", "-C", angle, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Pinned source"])
+        revision = proof.capture(["git", "-C", angle, "rev-parse", "HEAD"])
+        date = proof.capture(["git", "-C", angle, "show", "-s", "--format=%ci", "HEAD"])
+        header = self.out / "gen/angle/angle_commit.h"
+        header.parent.mkdir(parents=True)
+        header.write_text('#define ANGLE_COMMIT_HASH "' + revision[:12] + '"\n'
+                          '#define ANGLE_COMMIT_DATE "' + date + '"\n'
+                          '#define ANGLE_COMMIT_POSITION 1\n')
+        manifest = self.out / "build.ninja"
+        text = manifest.read_text().replace(" | ../../compiler.py", " | ../../compiler.py gen/angle/angle_commit.h")
+        text += ('\nrule angle_version\n  command = "' + sys.executable.replace("\\", "/") +
+                 '" -c "pass"\n  restat = 1\nbuild gen/angle/angle_commit.h: angle_version ../../third_party/angle/.git/HEAD\n')
+        manifest.write_text(text)
+        proof.capture([self.ninja, "-C", self.out, *self.built])
+        outputs = proof.ninja_outputs(self.out)
+        calls = (self.src / "calls.txt").read_text()
+        head = angle / ".git/HEAD"
+        future = time.time_ns() + 10_000_000_000
+        os.utime(head, ns=(future, future))
+        with self.assertRaisesRegex(RuntimeError, "would rebuild"):
+            proof.require_clean_targets(self.ninja, self.out, self.built, self.root / "angle-dirty.log")
+        self.assertEqual(proof.restore_angle_revision_clock(self.root, self.src, self.out), 1)
+        proof.require_clean_targets(self.ninja, self.out, self.built, self.root / "angle-restored.log")
+        proof.verify_outputs(self.out, outputs)
+        self.assertEqual((self.src / "calls.txt").read_text(), calls)
+        record = {"base": "root", "path": head.relative_to(self.root).as_posix(),
+                  "mtime_ns": head.stat().st_mtime_ns, "size": head.stat().st_size, "sha256": proof.digest(head)}
+        os.utime(head, ns=(future, future))
+        self.assertEqual(proof.restore_angle_revision_clock(self.root, self.src, self.out, [record]), 1)
+        proof.verify_files(self.root, [record])
+        header.write_text(header.read_text().replace(revision[:12], "0" * 12))
+        with self.assertRaisesRegex(RuntimeError, "ANGLE revision differs"):
+            proof.restore_angle_revision_clock(self.root, self.src, self.out)
+
     def test_fresh_input_timestamps_make_ninja_reject_reuse(self):
         source = self.src / "unit0.cc"
         future = time.time_ns() + 10_000_000_000

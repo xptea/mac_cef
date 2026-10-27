@@ -179,6 +179,50 @@ def restore_sdk_timestamps(root, records, sdk_root):
     return len(changes)
 
 
+def restore_angle_revision_clock(root, src, out, records=()):
+    """Restore only version-generator Git clocks after checking its saved revision."""
+    header = out / "gen/angle/angle_commit.h"
+    if not header.is_file():
+        return 0
+    angle = src / "third_party/angle"
+    content = header.read_text()
+    saved_hash = re.search(r'^#define ANGLE_COMMIT_HASH "([0-9a-f]{12})"$', content, re.M)
+    if not saved_hash:
+        raise RuntimeError("Saved ANGLE version header lacks a verifiable revision.")
+    revision = capture(["git", "-C", angle, "rev-parse", "HEAD"])
+    if not re.fullmatch(r"[0-9a-f]{40}", revision) or not revision.startswith(saved_hash[1]):
+        raise RuntimeError("Saved ANGLE revision differs from the restored checkout.")
+    position = re.search(r"^#define ANGLE_COMMIT_POSITION ([0-9]+)$", content, re.M)
+    if not position or position[1] != capture(["git", "-C", angle, "rev-list", "HEAD", "--count"]):
+        raise RuntimeError("Saved ANGLE commit position differs from the restored checkout.")
+    date = re.search(r'^#define ANGLE_COMMIT_DATE "([^"]+)"$', content, re.M)
+    if not date or (date[1] != "unknown date" and date[1] != capture(["git", "-C", angle, "show", "-s", "--format=%ci", "HEAD"])):
+        raise RuntimeError("Saved ANGLE commit date differs from the restored checkout.")
+    head = Path(capture(["git", "-C", angle, "rev-parse", "--path-format=absolute", "--git-path", "HEAD"]))
+    paths = [head]
+    words = head.read_text().split()
+    if words and words[0] == "ref:":
+        if len(words) != 2 or not words[1].startswith("refs/"):
+            raise RuntimeError("Unsupported ANGLE Git HEAD reference.")
+        paths.append(Path(capture(["git", "-C", angle, "rev-parse", "--path-format=absolute", "--git-path", words[1]])))
+    saved = {str((root / r["path"]).resolve()): r for r in records if r["base"] == "root"}
+    changed = 0
+    for path in paths:
+        path = path.resolve()
+        if not path.is_relative_to(root.resolve()) or not path.is_file():
+            raise RuntimeError("ANGLE revision metadata is outside the dedicated build tree.")
+        record = saved.get(str(path))
+        target_time = SOURCE_TIME_NS
+        if record:
+            if path.stat().st_size != record["size"] or digest(path) != record["sha256"]:
+                raise RuntimeError("Saved ANGLE Git metadata content changed.")
+            target_time = record["mtime_ns"]
+        if (record and path.stat().st_mtime_ns != target_time) or (not record and path.stat().st_mtime_ns > header.stat().st_mtime_ns):
+            os.utime(path, ns=(target_time, target_time))
+            changed += 1
+    return changed
+
+
 def pack_chromium_metadata(src):
     """Cache commit/tree metadata without duplicating the checked-out blob content."""
     pack = src / ".git/cef-source-metadata.pack"
@@ -210,7 +254,7 @@ def require_clean_targets(ninja, out, targets, log):
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text(result.stdout, encoding="utf-8")
     if result.returncode or "no work to do." not in result.stdout:
-        raise RuntimeError("Completed objects would rebuild. Inspect " + str(log) + "\n" + result.stdout[-10000:])
+        raise RuntimeError("Completed objects would rebuild. Inspect " + str(log) + "\n" + result.stdout[:7000] + "\n...\n" + result.stdout[-3000:])
 
 
 def file_bytes(folder):
@@ -453,6 +497,18 @@ class Probe:
     def save_source(self):
         if self.source_archive.is_file():
             return
+        # Report relative tree sizes so an oversized setup cache is diagnosable.
+        roots = [self.root / "tools", self.root / "work/cef", self.src / ".git"]
+        roots += [p for p in self.src.iterdir() if p.is_dir() and p.name not in (".git", "out", "third_party")]
+        third_party = self.src / "third_party"
+        roots += [p for p in third_party.iterdir() if p.is_dir()] if third_party.is_dir() else []
+        sizes = []
+        for line in capture(["du", "-sk", *[p for p in roots if p.exists()]], timeout=300).splitlines():
+            size, path = line.split("\t", 1)
+            sizes.append((int(size), Path(path).relative_to(self.root).as_posix()))
+        summary("Largest prepared-source components before compression", {
+            path: round(size / 1024 ** 2, 3) for size, path in sorted(sizes, reverse=True)[:15]
+        })
         pack_chromium_metadata(self.src)
         write_json(self.root / "source-cache.json", {"key": self.source_key()})
         self.source_archive.parent.mkdir(parents=True, exist_ok=True)
@@ -642,6 +698,7 @@ class Probe:
         sdk_root = Path(self.config["developer_dir"])
         normalized_sdk_inputs = restore_sdk_timestamps(self.root, checkpoint["dependencies"], sdk_root)
         sdk_aliases = verify_outputs(self.out, checkpoint["outputs"], sdk_root)
+        angle_clocks = restore_angle_revision_clock(self.root, self.src, self.out, checkpoint["dependencies"])
         verify_files(self.root, checkpoint["dependencies"])
         require_clean_targets(self.ninja(), self.out, checkpoint["samples"], self.root / "restored-dry-run.log")
         report = {"result": "PASS", "recovered_existing_checkpoint": recovery is not None,
@@ -650,6 +707,7 @@ class Probe:
                   "restored_runner_image": current.get("runner_image"),
                   "completed_outputs_preserved": len(checkpoint["outputs"])-sdk_aliases,
                   "sdk_alias_outputs": sdk_aliases, "identical_sdk_inputs_retimestamped": normalized_sdk_inputs,
+                  "verified_angle_revision_clocks_restored": angle_clocks,
                   "sampled_cpp_objects_requiring_recompile": 0, "sampled_cpp_objects": len(checkpoint["samples"]),
                   "verified_dependencies": len(checkpoint["dependencies"]),
                   "checkpoint_gib": round(self.archive.stat().st_size/GIB, 3),
