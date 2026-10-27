@@ -98,6 +98,51 @@ class CheckpointTests(ScratchCase):
                 probe.verify("other checksum", {"sha256": "approved checkpoint"})
             extract.assert_not_called()
 
+    def test_reset_output_tree_cannot_escape_build_root(self):
+        outside=self.root.parent / "outside-build-output"
+        with self.assertRaisesRegex(RuntimeError, "outside the dedicated build root"):
+            proof.reset_output_tree(self.root, outside)
+        with self.assertRaisesRegex(RuntimeError, "outside the dedicated build root"):
+            proof.reset_output_tree(self.root, self.root)
+
+    def test_clean_restore_removes_generated_sdk_tree_but_preserves_archive(self):
+        out=self.root / "work/chromium/src/out/Release_GN_arm64"
+        stale=out / "sdk/xcode_links/SDK"
+        stale.mkdir(parents=True)
+        (stale / "wrong-header.h").write_text("generated before restore")
+        archive=self.root / "checkpoint.tar.zst"
+        archive.write_bytes(b"preserved compiled checkpoint")
+        proof.reset_output_tree(self.root, out)
+        self.assertFalse(out.exists())
+        self.assertEqual(archive.read_bytes(), b"preserved compiled checkpoint")
+
+    def test_clean_restore_does_not_follow_sdk_directory_links(self):
+        out=self.root / "out"
+        out.mkdir()
+        external=self.root / "installed-sdk"
+        external.mkdir()
+        header=external / "header.h"
+        header.write_text("installed SDK")
+        try:
+            (out / "sdk").symlink_to(external, target_is_directory=True)
+        except OSError as error:
+            self.skipTest("Directory symlinks unavailable: " + str(error))
+        proof.reset_output_tree(self.root, out)
+        self.assertEqual(header.read_text(), "installed SDK")
+
+    @unittest.skipUnless(shutil.which("gtar") and shutil.which("zstd"), "GNU tar/zstd unavailable")
+    def test_source_cache_excludes_compiler_outputs(self):
+        work=self.root / "work/chromium/src"
+        out=work / "out/Release_GN_arm64"
+        out.mkdir(parents=True)
+        (out / "completed.o").write_bytes(b"compiled")
+        (work / "input.cc").write_text("source")
+        archive=self.root / "source.tar.zst"
+        proof.make_archive(self.root,archive,["work"],excludes=["work/chromium/src/out"])
+        members=proof.capture(["gtar","--use-compress-program=zstd","-tf",archive])
+        self.assertIn("input.cc",members)
+        self.assertNotIn("completed.o",members)
+
     def test_output_timestamp_loss_is_rejected(self):
         out = self.root / "out"
         out.mkdir()
@@ -169,6 +214,66 @@ class DepotBootstrapTests(ScratchCase):
                 self.probe.bootstrap_depot()
 
 
+class PreparedSourceTests(ScratchCase):
+    def test_source_key_tracks_build_inputs_but_not_image_or_recipe_labels(self):
+        probe=proof.Probe.__new__(proof.Probe)
+        probe.config={"automate_sha256":"pinned automation"}
+        identity={"cef_commit":"same", "gn_args":{"target_cpu":"arm64"},
+                  "sdk":"same sdk", "runner_image":"old", "recipe_sha256":"old"}
+        probe.identity=mock.Mock(return_value=identity.copy())
+        key=probe.source_key()
+        probe.identity.return_value={**identity,"runner_image":"new","recipe_sha256":"new"}
+        self.assertEqual(probe.source_key(),key)
+        probe.identity.return_value={**identity,"cef_commit":"different source"}
+        self.assertNotEqual(probe.source_key(),key)
+
+    def test_bad_source_archive_checksum_is_rejected_before_extracting(self):
+        probe=proof.Probe.__new__(proof.Probe)
+        probe.source_archive=self.root / "source.tar.zst"
+        probe.source_archive.write_bytes(b"damaged source archive")
+        probe.source_archive.with_suffix(".sha256").write_text("0"*64)
+        with mock.patch.object(proof,"extract_archive") as extract:
+            with self.assertRaisesRegex(RuntimeError,"source cache checksum"):
+                probe.restore_source()
+            extract.assert_not_called()
+
+    def test_warm_source_preparation_does_not_run_download_or_bootstrap(self):
+        probe=proof.Probe.__new__(proof.Probe)
+        probe.root=self.root
+        (self.root / ".cef-checkpoint-probe").touch()
+        probe.config=proof.read_json(proof.REPO / "cef.json")
+        probe.src=self.root / "work/chromium/src"
+        probe.out=probe.src / "out/Release_GN_arm64"
+        probe.depot=self.root / "tools/depot_tools"
+        probe.depot.mkdir(parents=True)
+        probe.out.mkdir(parents=True)
+        automate=self.root / "tools/automate-git.py"
+        automate.write_text("cached verified automation")
+        probe.config["automate_sha256"]=proof.digest(automate)
+        probe.config["minimum_prepare_free_gib"]=0
+        probe.gn={"target_cpu":"arm64"}
+        (probe.out / "args.gn").write_text('target_cpu = "arm64"\n')
+        probe.env={}
+        probe.inspect=mock.Mock(return_value={})
+        probe.restore_source=mock.Mock(return_value=True)
+        probe.bootstrap_depot=mock.Mock()
+        probe.run=mock.Mock()
+        probe.identity=mock.Mock(return_value={"test":"pinned identity"})
+        def capture(command,**kwargs):
+            if str(command[0]) == "git":
+                if command[2] == probe.depot:
+                    return probe.config["depot_tools_commit"]
+                if command[2] == probe.src:
+                    return probe.config["chromium_commit"]
+                return probe.config["cef_commit"]
+            return "Python/compiler version"
+        with mock.patch.object(proof,"capture",side_effect=capture), \
+             mock.patch.object(proof.urllib.request,"urlopen",side_effect=AssertionError("download requested")):
+            probe.prepare()
+        probe.bootstrap_depot.assert_not_called()
+        self.assertEqual([call.args[1] for call in probe.run.call_args_list],["configure"])
+
+
 class RealNinjaTests(ScratchCase):
     def setUp(self):
         super().setUp()
@@ -195,6 +300,7 @@ class RealNinjaTests(ScratchCase):
         for i in range(5):
             (self.src / f"unit{i}.cc").write_text(f"unit {i}\n")
             lines.append(f"build obj/unit{i}.o: cc ../../unit{i}.cc | ../../compiler.py")
+        lines.append("build cefclient: phony " + " ".join(f"obj/unit{i}.o" for i in range(5)))
         lines.append("default " + " ".join(f"obj/unit{i}.o" for i in range(5)))
         (self.out / "build.ninja").write_text("\n".join(lines) + "\n")
         proof.normalize_sources(self.src)
@@ -248,6 +354,11 @@ class RealNinjaTests(ScratchCase):
         proof.require_clean_targets(self.ninja, self.out, self.built, self.root / "directory-restored.log")
         proof.verify_outputs(self.out, outputs)
         self.assertEqual((self.src / "calls.txt").read_text(), calls)
+
+    def test_remaining_build_steps_counts_actions_instead_of_output_files(self):
+        self.assertEqual(proof.remaining_steps(self.ninja,self.out,self.root / "remaining.log"), 1)
+        proof.capture([self.ninja,"-C",self.out,"obj/unit4.o"])
+        self.assertEqual(proof.remaining_steps(self.ninja,self.out,self.root / "done.log"), 0)
 
     def test_fresh_input_timestamps_make_ninja_reject_reuse(self):
         source = self.src / "unit0.cc"

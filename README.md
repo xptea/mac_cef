@@ -125,3 +125,31 @@ GNU tar/zstd round-trip tests also run when those tools are available.
 - https://github.com/chromiumembedded/cef/blob/master/docs/automated_build_setup.md
 - https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md
 
+
+## Continue toward the full engine build
+
+Use **Actions > Continue full CEF build**. Leave checkpoint fields blank for the
+existing preserved checkpoint, or supply the exact key/checksum/recipe from a
+later batch. This builds the real `cefclient` target until Ninja reports no work
+remaining; it is not another fixed 20-minute sample.
+
+Each job allows up to four hours of compilation, but reduces that window when
+setup consumed time so a checkpoint can still be saved before the job limit.
+After a successful cache save, unfinished work automatically dispatches the next
+job. The automatic chain is bounded to 12 batches and stops on an error or zero
+forward progress; the saved checkpoint remains available for repair and retry.
+Logs now expose actual Ninja remaining-step counts and recent compiler output.
+
+Prepared source and downloaded tools are cached separately under an exact
+source/toolchain key. A warm cache skips Chromium download and dependency sync;
+GN configuration and validation still run. The first cold job must reconstruct
+that setup once. Source archives are capped at 6 GiB, compiled archives at 8 GiB;
+source snapshot creation stops if its limit is exceeded and reports that result
+instead of silently assuming the source cache fits. No paid cache limit is set.
+A complete source cache and a large compiled checkpoint may compete for the
+repository cache budget; actual compression and eviction must be measured.
+
+Checkpoint restoration now clears only the generated output directory inside
+the dedicated runner build root before extraction. It does not overlay archived
+SDK trees on links created by fresh GN configuration, and does not remove the
+preserved archive or follow links into the installed SDK.

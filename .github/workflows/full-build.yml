@@ -1,0 +1,152 @@
+name: Continue full CEF build
+on:
+  workflow_dispatch:
+    inputs:
+      checkpoint_key:
+        description: Saved checkpoint key; leave all checkpoint fields blank to use recovery.json.
+        type: string
+        default: ''
+      checkpoint_sha256:
+        description: Exact saved archive SHA-256.
+        type: string
+        default: ''
+      checkpoint_recipe:
+        description: Exact recipe fingerprint that created the checkpoint.
+        type: string
+        default: ''
+      batch:
+        description: Continuation batch index (1-12).
+        type: number
+        default: 1
+      chain:
+        description: Automatically start the next batch after safely saving unfinished work.
+        type: boolean
+        default: true
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: cef-full-build
+  cancel-in-progress: false
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  CEF_CHECKPOINT_KEY: cef-build-v1-${{ github.run_id }}-${{ github.run_attempt }}
+jobs:
+  build:
+    name: Recover and continue the real cefclient engine target
+    runs-on: macos-26
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Establish a checkpoint-safe job deadline
+        env:
+          BATCH: ${{ inputs.batch }}
+        run: |
+          python3 - <<'PY'
+          import os, time
+          batch=int(os.environ['BATCH'])
+          assert 1 <= batch <= 12, 'Batch index must be between 1 and 12'
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('CEF_JOB_DEADLINE=' + str(time.time()+300*60) + '\n')
+          PY
+      - name: Check recovery logic
+        run: python3 -m unittest discover -s tests -v
+      - name: Identify reusable prepared source
+        id: source_key
+        run: python3 scripts/checkpoint.py source-key
+      - name: Restore reusable source and tool setup
+        id: source_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/cef-source-cache/source.tar.zst
+            ~/cef-source-cache/source.tar.sha256
+          key: ${{ steps.source_key.outputs.key }}
+      - name: Prepare pinned source using the warm setup when available
+        run: python3 scripts/checkpoint.py prepare
+      - name: Snapshot reusable prepared source on a cache miss
+        if: steps.source_cache.outputs.cache-hit != 'true'
+        id: source_snapshot
+        run: python3 scripts/checkpoint.py save-source
+      - name: Retain prepared source for later jobs and retries
+        if: steps.source_cache.outputs.cache-hit != 'true' && steps.source_snapshot.outputs.ready == 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/cef-source-cache/source.tar.zst
+            ~/cef-source-cache/source.tar.sha256
+          key: ${{ steps.source_key.outputs.key }}
+      - name: Select the compiled checkpoint to continue
+        id: seed
+        env:
+          CHECKPOINT_KEY: ${{ inputs.checkpoint_key }}
+          CHECKPOINT_SHA256: ${{ inputs.checkpoint_sha256 }}
+          CHECKPOINT_RECIPE: ${{ inputs.checkpoint_recipe }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          key=os.environ['CHECKPOINT_KEY']
+          sha=os.environ['CHECKPOINT_SHA256']
+          recipe=os.environ['CHECKPOINT_RECIPE']
+          if not any([key,sha,recipe]):
+              with open('recovery.json') as stream:
+                  seed=json.load(stream)
+          else:
+              assert re.fullmatch(r'cef-(?:proof|build)-v1-[0-9]+-[0-9]+', key), 'Invalid checkpoint key'
+              assert re.fullmatch(r'[0-9a-f]{64}', sha), 'Invalid checkpoint checksum'
+              assert re.fullmatch(r'[0-9a-f]{64}', recipe), 'Invalid checkpoint recipe'
+              seed={'key':key, 'sha256':sha, 'recipe_sha256':recipe}
+          with open('checkpoint-seed.json','w') as stream:
+              json.dump(seed,stream)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as stream:
+              stream.write('key='+seed['key']+'\n')
+              stream.write('sha256='+seed['sha256']+'\n')
+          PY
+      - name: Restore completed compiler work
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/cef-checkpoint/checkpoint.tar.zst
+          key: ${{ steps.seed.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Prove saved objects remain up to date before continuing
+        env:
+          EXPECTED_CHECKPOINT_SHA256: ${{ steps.seed.outputs.sha256 }}
+        run: python3 scripts/checkpoint.py verify --checkpoint-manifest checkpoint-seed.json --expected-sha256 "$EXPECTED_CHECKPOINT_SHA256"
+      - name: Continue compiling toward the full engine for up to four hours
+        id: compile
+        run: python3 scripts/checkpoint.py compile --seconds 14400
+      - name: Save all completed work and the remaining-step count
+        id: snapshot
+        run: python3 scripts/checkpoint.py save
+      - name: Retain the new compiled checkpoint
+        uses: actions/cache/save@v5
+        with:
+          path: ~/cef-checkpoint/checkpoint.tar.zst
+          key: ${{ env.CEF_CHECKPOINT_KEY }}
+      - name: Continue automatically when engine work remains
+        if: steps.compile.outputs.complete != 'true' && inputs.chain
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BATCH: ${{ inputs.batch }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          receipt=json.loads((Path.home()/'cef-checkpoint/receipt.json').read_text())
+          batch=int(os.environ['BATCH'])
+          assert receipt['completed_build_steps_this_job'] > 0, 'No forward progress; preserve the cache and diagnose'
+          assert batch < 12, 'Automatic batch safety limit reached; compiled work remains saved'
+          subprocess.run(['gh','workflow','run','full-build.yml','--repo',os.environ['GITHUB_REPOSITORY'],
+                          '--ref',os.environ['GITHUB_REF_NAME'],
+                          '-f','checkpoint_key='+receipt['key'],
+                          '-f','checkpoint_sha256='+receipt['sha256'],
+                          '-f','checkpoint_recipe='+receipt['recipe_sha256'],
+                          '-f','batch='+str(batch+1), '-f','chain=true'], check=True)
+          print('Next full-build batch dispatched from the newly saved checkpoint.')
+          PY

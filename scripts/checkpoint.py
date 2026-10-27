@@ -145,19 +145,38 @@ def file_bytes(folder):
     return sum(p.stat().st_size for p in folder.rglob("*") if p.is_file() and not p.is_symlink())
 
 
-def make_archive(root, archive, members):
+class ArchiveTooLarge(RuntimeError):
+    pass
+
+
+def make_archive(root, archive, members, excludes=(), max_bytes=None, timeout=900):
     tar, zstd = shutil.which("gtar"), shutil.which("zstd")
     if not tar or not zstd:
         raise RuntimeError("GNU tar (gtar) and zstd are required to preserve Ninja timestamps.")
     with (root / "archive.log").open("w") as errors:
-        producer = subprocess.Popen([tar, "--format=posix", "-C", str(root), "-cf", "-", *members],
+        options = [value for pattern in excludes for value in ("--exclude", pattern)]
+        producer = subprocess.Popen([tar, "--format=posix", *options, "-C", str(root), "-cf", "-", *members],
                                     stdout=subprocess.PIPE, stderr=errors)
         consumer = subprocess.Popen([zstd, "-q", "-T2", "-6", "-f", "-o", str(archive)],
                                     stdin=producer.stdout, stderr=errors)
         producer.stdout.close()
         try:
-            consumer_code = consumer.wait(timeout=900)
+            started = time.monotonic()
+            next_report = started
+            while consumer.poll() is None:
+                if time.monotonic() >= next_report:
+                    size = archive.stat().st_size if archive.exists() else 0
+                    print(f"Compressing {archive.name}: {int(time.monotonic()-started)}s; {size/GIB:.2f} GiB written", flush=True)
+                    next_report = time.monotonic() + 30
+                if max_bytes is not None and archive.exists() and archive.stat().st_size > max_bytes:
+                    raise ArchiveTooLarge("Archive exceeded its cache budget.")
+                if time.monotonic() - started > timeout:
+                    raise RuntimeError("Archive compression exceeded its time budget.")
+                time.sleep(1)
+            consumer_code = consumer.returncode
             producer_code = producer.wait(timeout=30)
+            if max_bytes is not None and archive.stat().st_size > max_bytes:
+                raise ArchiveTooLarge("Archive exceeded its cache budget.")
         finally:
             for process in (consumer, producer):
                 if process.poll() is None:
@@ -165,6 +184,31 @@ def make_archive(root, archive, members):
                     process.wait()
         if consumer_code or producer_code:
             raise RuntimeError("Checkpoint compression failed; inspect archive.log")
+
+
+def reset_output_tree(root, out):
+    """Only discard fresh generated output; the verified archive stays outside it."""
+    root = root.resolve()
+    if out.is_symlink() or not out.resolve().is_relative_to(root) or out.resolve() == root:
+        raise RuntimeError("Refusing to reset an output directory outside the dedicated build root.")
+    if out.exists():
+        shutil.rmtree(out)
+
+
+def remaining_steps(ninja, out, log):
+    env = dict(os.environ, NINJA_STATUS="[%f/%t] ")
+    result = subprocess.run([str(ninja), "-C", str(out), "-n", "cefclient"], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            errors="replace", timeout=300)
+    log.write_text(result.stdout, encoding="utf-8")
+    if result.returncode or "Regenerating ninja files" in result.stdout:
+        raise RuntimeError("Cannot count remaining build steps: " + result.stdout[-10000:])
+    if "no work to do." in result.stdout:
+        return 0
+    totals = [int(v) for v in re.findall(r"(?m)^\[\d+/(\d+)\]", result.stdout)]
+    if not totals:
+        raise RuntimeError("Ninja did not report a remaining-step total.")
+    return max(totals)
 
 
 def extract_archive(root, archive):
@@ -185,6 +229,7 @@ class Probe:
         self.out = self.src / "out/Release_GN_arm64"
         self.depot = self.root / "tools/depot_tools"
         self.archive = self.root / "checkpoint.tar.zst"
+        self.source_archive = Path.home() / "cef-source-cache/source.tar.zst"
         self.env = dict(os.environ)
         self.env.update(DEPOT_TOOLS_UPDATE="0", DEPOT_TOOLS_BOOTSTRAP_PYTHON3="1",
                         CEF_ENABLE_ARM64="1", PYTHONUNBUFFERED="1",
@@ -261,6 +306,13 @@ class Probe:
                     now = time.monotonic()
                     if now >= next_report:
                         print(f"{label}: {int(now-started)}s; {shutil.disk_usage(self.root).free/GIB:.1f} GiB free", flush=True)
+                        output.flush()
+                        if log.stat().st_size:
+                            with log.open("rb") as recent:
+                                recent.seek(max(0, log.stat().st_size - 8192))
+                                lines = recent.read().decode("utf-8", errors="replace").splitlines()
+                            if lines:
+                                print(label + " latest: " + lines[-1][-1200:], flush=True)
                         next_report = now + 30
                     if shutil.disk_usage(self.root).free < self.config["minimum_runtime_free_gib"] * GIB:
                         raise RuntimeError("Low disk space; stopping this command to retain upload space.")
@@ -303,6 +355,57 @@ class Probe:
             raise RuntimeError("depot_tools revision changed during bootstrap.")
         print("Pinned depot_tools initialized: " + version, flush=True)
 
+    def source_key(self):
+        identity = self.identity()
+        identity.pop("runner_image")
+        identity.pop("recipe_sha256")
+        encoded = json.dumps({"format": 1, "identity": identity,
+                              "automate_sha256": self.config["automate_sha256"]}, sort_keys=True).encode()
+        return "cef-source-v1-" + hashlib.sha256(encoded).hexdigest()[:32]
+
+    def restore_source(self):
+        if not self.source_archive.is_file():
+            return False
+        checksum_file = self.source_archive.with_suffix(".sha256")
+        checksum = checksum_file.read_text().strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", checksum) or digest(self.source_archive) != checksum:
+            raise RuntimeError("Prepared-source cache checksum mismatch.")
+        extract_archive(self.root, self.source_archive)
+        manifest = read_json(self.root / "source-cache.json")
+        if manifest["key"] != self.source_key():
+            raise RuntimeError("Prepared-source cache identity mismatch.")
+        print("Prepared-source cache restored; skipping Chromium download and gclient sync.", flush=True)
+        return True
+
+    def save_source(self):
+        if self.source_archive.is_file():
+            return
+        write_json(self.root / "source-cache.json", {"key": self.source_key()})
+        self.source_archive.parent.mkdir(parents=True, exist_ok=True)
+        # Keep source+tools inside the included repository cache budget. Existing
+        # compiled checkpoints are neither removed nor included in this archive.
+        try:
+            make_archive(self.root, self.source_archive,
+                         [".cef-checkpoint-probe", "source-cache.json", "tools", "work"],
+                         excludes=["work/chromium/src/out", "work/out_*"],
+                         max_bytes=6 * GIB, timeout=1200)
+        except ArchiveTooLarge:
+            self.source_archive.unlink(missing_ok=True)
+            summary("Source cache size limit", {
+                "result": "Prepared source exceeded the 6 GiB budget; compiled cache is untouched.",
+                "action": "Measure a smaller source/tool cache before retrying cold setup again.",
+            })
+            return
+        checksum = digest(self.source_archive)
+        self.source_archive.with_suffix(".sha256").write_text(checksum + "\n")
+        if os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+                stream.write("ready=true\n")
+        summary("Reusable source cache ready", {
+            "compressed_gib": round(self.source_archive.stat().st_size / GIB, 3),
+            "purpose": "Skip source downloads and dependency sync on subsequent jobs.",
+        })
+
     def prepare(self, reclaim=False):
         data = self.inspect()
         if reclaim:
@@ -315,6 +418,7 @@ class Probe:
             raise RuntimeError("Refusing to adopt an unmarked nonempty build folder.")
         self.root.mkdir(parents=True, exist_ok=True)
         marker.touch()
+        warm_source = self.restore_source()
         tools = self.root / "tools"
         tools.mkdir(exist_ok=True)
         automate = tools / "automate-git.py"
@@ -333,13 +437,16 @@ class Probe:
             self.run(["git", "-C", self.depot, "checkout", "--detach", "FETCH_HEAD"], "depot-checkout", timeout=60)
         if capture(["git", "-C", self.depot, "rev-parse", "HEAD"]) != self.config["depot_tools_commit"]:
             raise RuntimeError("Unexpected depot_tools revision.")
-        self.bootstrap_depot()
-        self.run([sys.executable, automate, f"--download-dir={self.root / 'work'}",
-                  f"--depot-tools-dir={self.depot}", f"--branch={self.config['branch']}",
-                  f"--checkout={self.config['cef_commit']}", "--arm64-build", "--with-pgo-profiles",
-                  "--no-debug-build", "--fast-update", "--no-depot-tools-update",
-                  "--no-chromium-history", "--no-build", "--no-distrib", "--force-update"],
-                 "source-setup", timeout=10800)
+        if warm_source:
+            capture(["/bin/bash", self.depot / "python-bin/python3", "--version"], env=self.env)
+        else:
+            self.bootstrap_depot()
+            self.run([sys.executable, automate, f"--download-dir={self.root / 'work'}",
+                      f"--depot-tools-dir={self.depot}", f"--branch={self.config['branch']}",
+                      f"--checkout={self.config['cef_commit']}", "--arm64-build", "--with-pgo-profiles",
+                      "--no-debug-build", "--fast-update", "--no-depot-tools-update",
+                      "--no-chromium-history", "--no-build", "--no-distrib", "--force-update"],
+                     "source-setup", timeout=10800)
         for folder, expected in [(self.src, self.config["chromium_commit"]),
                                  (self.root / "work/cef", self.config["cef_commit"])]:
             if capture(["git", "-C", folder, "rev-parse", "HEAD"]) != expected:
@@ -365,16 +472,29 @@ class Probe:
         return self.src / "third_party/ninja/ninja"
 
     def compile(self, seconds):
-        if not 60 <= seconds <= 3600:
-            raise RuntimeError("The first checkpoint proof is limited to 60–3600 compilation seconds.")
+        if not 60 <= seconds <= 14400:
+            raise RuntimeError("Compilation windows must be between 60 and 14400 seconds.")
+        deadline = os.environ.get("CEF_JOB_DEADLINE")
+        if deadline:
+            seconds = min(seconds, int(float(deadline) - time.time() - 1200))
+            if seconds < 60:
+                raise RuntimeError("Not enough job time remains for another compile window and safe checkpoint save.")
         if read_json(self.root / "identity.json")["recipe_sha256"] != digest(Path(__file__)):
             raise RuntimeError("Prepare the same recipe before compiling.")
+        before = remaining_steps(self.ninja(), self.out, self.root / "remaining-before.log")
+        summary("CEF compile starting", {"remaining_build_steps": before, "window_seconds": seconds})
         result = self.run([self.ninja(), "-C", self.out, "-j", str(self.config["jobs"]), "cefclient"],
-                          "partial-compile", compile_seconds=seconds)
+                          "partial-compile", timeout=seconds + 60, compile_seconds=seconds)
         outputs = ninja_outputs(self.out)
         samples = samples_for(outputs)
         require_clean_targets(self.ninja(), self.out, samples, self.root / "baseline-dry-run.log")
+        after = remaining_steps(self.ninja(), self.out, self.root / "remaining-after.log")
+        result.update(remaining_build_steps=after, completed_build_steps_this_job=before-after,
+                      full_build_complete=after == 0)
         write_json(self.root / "compile-result.json", result)
+        if os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+                stream.write("complete=" + str(after == 0).lower() + "\n")
         summary("Partial CEF compilation complete", {**result, "completed_outputs": len(outputs),
                                                     "sampled_cpp_objects": len(samples)})
 
@@ -402,7 +522,8 @@ class Probe:
             stat = path.stat()
             records.append({"base": base, "path": relative, "size": stat.st_size,
                             "mtime_ns": stat.st_mtime_ns, "sha256": digest(path)})
-        checkpoint = {"schema": 1, "identity": read_json(self.root / "identity.json"),
+        build_state = read_json(self.root / "compile-result.json") if (self.root / "compile-result.json").is_file() else {}
+        checkpoint = {"schema": 1, "build_state": build_state, "identity": read_json(self.root / "identity.json"),
                       "outputs": outputs, "samples": samples, "dependencies": records,
                       "out_relative": self.out.relative_to(self.root).as_posix()}
         write_json(self.root / "checkpoint.json", checkpoint)
@@ -415,7 +536,12 @@ class Probe:
         if os.environ.get("GITHUB_OUTPUT"):
             with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
                 stream.write("sha256=" + checksum + "\n")
-        summary("Checkpoint ready for a fresh runner", {
+        receipt = {"key": os.environ.get("CEF_CHECKPOINT_KEY", ""), "sha256": checksum,
+                   "recipe_sha256": checkpoint["identity"]["recipe_sha256"],
+                   "completed_outputs": len(outputs), **build_state}
+        write_json(self.root / "receipt.json", receipt)
+        print("CEF_CHECKPOINT_RECEIPT " + json.dumps(receipt, sort_keys=True), flush=True)
+        summary("Checkpoint ready for a fresh runner", {**build_state,
             "completed_outputs": len(outputs), "sampled_cpp_objects": len(samples),
             "hashed_dependencies": len(records), "uncompressed_gib": round(raw/GIB, 3),
             "checkpoint_gib": round(size/GIB, 3), "sha256": checksum,
@@ -428,6 +554,7 @@ class Probe:
         current = read_json(self.root / "identity.json")
         if not re.fullmatch(r"[0-9a-f]{64}", expected) or digest(self.archive) != expected:
             raise RuntimeError("Downloaded checkpoint checksum mismatch.")
+        reset_output_tree(self.root, self.out)
         extract_archive(self.root, self.archive)
         checkpoint = read_json(self.root / "checkpoint.json")
         if checkpoint["schema"] != 1 or checkpoint["out_relative"] != self.out.relative_to(self.root).as_posix():
@@ -456,11 +583,13 @@ class Probe:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("inspect", "prepare", "compile", "save", "verify"), nargs="?", default="inspect")
+    parser.add_argument("action", choices=("inspect", "source-key", "save-source", "prepare", "compile", "save", "verify"), nargs="?", default="inspect")
     parser.add_argument("--root", type=Path, default=Path.home() / "cef-checkpoint")
     parser.add_argument("--reclaim-unused-xcodes", action="store_true")
     parser.add_argument("--seconds", type=int, default=1200)
     parser.add_argument("--expected-sha256", default="")
+    parser.add_argument("--checkpoint-manifest", type=Path,
+                        help="Checksum-pinned checkpoint receipt supplied by the build workflow.")
     parser.add_argument("--recover-existing", action="store_true",
                         help="Verify the exact checkpoint approved in recovery.json; never compiles.")
     args = parser.parse_args()
@@ -468,6 +597,14 @@ def main():
     probe.mac_only()
     if args.action == "inspect":
         probe.inspect()
+    elif args.action == "source-key":
+        key = probe.source_key()
+        print(key)
+        if os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+                stream.write("key=" + key + "\n")
+    elif args.action == "save-source":
+        probe.save_source()
     elif args.action == "prepare":
         probe.prepare(args.reclaim_unused_xcodes)
     elif args.action == "compile":
@@ -475,7 +612,8 @@ def main():
     elif args.action == "save":
         probe.save()
     else:
-        recovery = read_json(REPO / "recovery.json") if args.recover_existing else None
+        recovery = read_json(args.checkpoint_manifest) if args.checkpoint_manifest else (
+            read_json(REPO / "recovery.json") if args.recover_existing else None)
         probe.verify(args.expected_sha256, recovery)
 
 

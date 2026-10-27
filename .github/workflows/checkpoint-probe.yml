@@ -64,6 +64,17 @@ jobs:
         with:
           python-version: '3.12'
           architecture: arm64
+      - name: Identify reusable prepared source
+        id: source_key
+        run: python3 scripts/checkpoint.py source-key
+      - name: Restore reusable source and tool setup
+        id: source_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/cef-source-cache/source.tar.zst
+            ~/cef-source-cache/source.tar.sha256
+          key: ${{ steps.source_key.outputs.key }}
       - name: Prepare shallow pinned source and identical build paths
         env:
           RECLAIM_UNUSED_XCODES: ${{ inputs.reclaim_unused_xcodes }}
@@ -71,6 +82,18 @@ jobs:
           flags=()
           if [ "$RECLAIM_UNUSED_XCODES" = "true" ]; then flags+=(--reclaim-unused-xcodes); fi
           python3 scripts/checkpoint.py prepare "${flags[@]}"
+      - name: Snapshot reusable prepared source on a cache miss
+        if: steps.source_cache.outputs.cache-hit != 'true'
+        id: source_snapshot
+        run: python3 scripts/checkpoint.py save-source
+      - name: Retain prepared source for later jobs and retries
+        if: steps.source_cache.outputs.cache-hit != 'true' && steps.source_snapshot.outputs.ready == 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/cef-source-cache/source.tar.zst
+            ~/cef-source-cache/source.tar.sha256
+          key: ${{ steps.source_key.outputs.key }}
       - name: Compile for the limited test window
         env:
           COMPILE_SECONDS: ${{ inputs.compile_seconds }}
@@ -97,6 +120,17 @@ jobs:
         with:
           python-version: '3.12'
           architecture: arm64
+      - name: Identify reusable prepared source
+        id: source_key
+        run: python3 scripts/checkpoint.py source-key
+      - name: Restore reusable source and tool setup
+        id: source_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/cef-source-cache/source.tar.zst
+            ~/cef-source-cache/source.tar.sha256
+          key: ${{ steps.source_key.outputs.key }}
       - name: Recreate the same pinned inputs on a fresh runner
         env:
           RECLAIM_UNUSED_XCODES: ${{ inputs.reclaim_unused_xcodes }}
@@ -104,6 +138,18 @@ jobs:
           flags=()
           if [ "$RECLAIM_UNUSED_XCODES" = "true" ]; then flags+=(--reclaim-unused-xcodes); fi
           python3 scripts/checkpoint.py prepare "${flags[@]}"
+      - name: Snapshot reusable prepared source on a cache miss
+        if: steps.source_cache.outputs.cache-hit != 'true'
+        id: source_snapshot
+        run: python3 scripts/checkpoint.py save-source
+      - name: Retain prepared source for later jobs and retries
+        if: steps.source_cache.outputs.cache-hit != 'true' && steps.source_snapshot.outputs.ready == 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/cef-source-cache/source.tar.zst
+            ~/cef-source-cache/source.tar.sha256
+          key: ${{ steps.source_key.outputs.key }}
       - name: Restore the exact checkpoint from the preceding job
         uses: actions/cache/restore@v5
         with:
@@ -141,6 +187,17 @@ jobs:
               stream.write('key=' + recovery['key'] + '\n')
               stream.write('sha256=' + recovery['sha256'] + '\n')
           PY
+      - name: Identify reusable prepared source
+        id: source_key
+        run: python3 scripts/checkpoint.py source-key
+      - name: Restore reusable source and tool setup
+        id: source_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/cef-source-cache/source.tar.zst
+            ~/cef-source-cache/source.tar.sha256
+          key: ${{ steps.source_key.outputs.key }}
       - name: Recreate pinned source with stable file and directory timestamps
         env:
           RECLAIM_UNUSED_XCODES: ${{ inputs.reclaim_unused_xcodes }}
@@ -148,6 +205,18 @@ jobs:
           flags=()
           if [ "$RECLAIM_UNUSED_XCODES" = "true" ]; then flags+=(--reclaim-unused-xcodes); fi
           python3 scripts/checkpoint.py prepare "${flags[@]}"
+      - name: Snapshot reusable prepared source on a cache miss
+        if: steps.source_cache.outputs.cache-hit != 'true'
+        id: source_snapshot
+        run: python3 scripts/checkpoint.py save-source
+      - name: Retain prepared source for later jobs and retries
+        if: steps.source_cache.outputs.cache-hit != 'true' && steps.source_snapshot.outputs.ready == 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/cef-source-cache/source.tar.zst
+            ~/cef-source-cache/source.tar.sha256
+          key: ${{ steps.source_key.outputs.key }}
       - name: Restore the preserved compiled checkpoint
         uses: actions/cache/restore@v5
         with:

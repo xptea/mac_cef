@@ -5,3 +5,5 @@ reports/
 *.pyc
 .DS_Store
 
+
+/checkpoint-seed.json
