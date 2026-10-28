@@ -14,9 +14,12 @@ def main():
     receipt = json.loads((repo / "checkpoint-inspection.json").read_text())
     probe = checkpoint.Probe(Path.home() / "cef-checkpoint")
     assert checkpoint.digest(probe.archive) == receipt["sha256"], "Checkpoint checksum mismatch"
+    subprocess.run(["gtar", "--use-compress-program=zstd", "-xf", str(probe.archive),
+                    "-C", str(probe.root), "checkpoint.json"], check=True)
     saved = checkpoint.read_json(probe.root / "checkpoint.json")
+    assert saved["identity"]["recipe_sha256"] == receipt["recipe_sha256"], "Recipe mismatch"
     assert saved["build_state"]["full_build_complete"] and saved["build_state"]["remaining_build_steps"] == 0
-    # inspect_saved has validated this dedicated disposable runner output tree.
+    # Prepare an empty source tree; the saved outputs are restored only after GN configuration.
     (probe.root / ".cef-checkpoint-probe").touch()
     probe.prepare()
     probe.verify(receipt["sha256"], receipt)
