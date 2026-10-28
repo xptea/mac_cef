@@ -7,6 +7,7 @@ import subprocess
 import platform
 import re
 import struct
+import plistlib
 
 
 def compiler_target(version):
@@ -61,6 +62,31 @@ def main():
     out = (root / checkpoint["out_relative"]).resolve()
     assert out.is_relative_to(root.resolve()), "Output tree outside inspection root"
     print("Saved output count:", len(checkpoint["outputs"]), flush=True)
+    if checkpoint.get("build_state", {}).get("full_build_complete"):
+        assert checkpoint["build_state"]["remaining_build_steps"] == 0
+        app = out / "cefclient.app"
+        bundles = [app, *app.glob("Contents/Frameworks/*.app")]
+        assert len(bundles) > 1, "Native helper app bundles missing"
+        binaries = []
+        for bundle in bundles:
+            info = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
+            binary = bundle / "Contents/MacOS" / info["CFBundleExecutable"]
+            assert binary.is_file() and binary.stat().st_size > 0, "App executable missing"
+            binaries.append(binary)
+        frameworks = list(app.glob("Contents/Frameworks/Chromium Embedded Framework.framework"))
+        assert frameworks, "CEF framework missing from app bundle"
+        for framework in frameworks:
+            binaries.append(framework / "Chromium Embedded Framework")
+            assert (framework / "Resources").is_dir(), "Framework resources missing"
+            assert any((framework / "Resources").iterdir()), "Framework resources empty"
+        for binary in binaries:
+            detail = subprocess.check_output(["file", str(binary)], text=True).strip()
+            assert "Mach-O" in detail and "arm64" in detail, detail
+            subprocess.run(["otool", "-L", str(binary)], check=True)
+            print("PRESERVED_NATIVE_OUTPUT", json.dumps({"path": binary.relative_to(out).as_posix(),
+                  "size": binary.stat().st_size, "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                  "file": detail}), flush=True)
+        print("FINAL_NATIVE_OUTPUT_VALIDATION: PASS; app, helpers, framework and resources restored. GUI launch, signing and distribution packaging not tested.", flush=True)
     sdk_outputs = {name: record for name, record in checkpoint["outputs"].items() if name.startswith("sdk/")}
     print("SDK-shaped output count:", len(sdk_outputs), flush=True)
     by_resolved = {record["path"]: record for record in checkpoint["dependencies"] if record["base"] == "external"}
