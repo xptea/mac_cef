@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,29 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import checkpoint as proof
+import inspect_saved
+
+
+
+class CachedArchitectureTests(unittest.TestCase):
+    def test_native_program_architecture_without_executing_it(self):
+        for cpu, arch in [(0x01000007, "x86_64"), (0x0100000C, "arm64")]:
+            header = struct.pack("<IIIIIIII", 0xFEEDFACF, cpu, 0, 2, 0, 0, 0, 0)
+            self.assertEqual(inspect_saved.executable_architectures(header), {arch})
+            # Object files target ARM even when the build host is Intel.
+            obj = struct.pack("<IIIIIIII", 0xFEEDFACF, cpu, 0, 1, 0, 0, 0, 0)
+            self.assertEqual(inspect_saved.executable_architectures(obj), set())
+        self.assertEqual(inspect_saved.executable_architectures(b"BC" + b"0" * 30), set())
+
+    def test_universal_program_and_malformed_header(self):
+        header = struct.pack(">II", 0xCAFEBABE, 2)
+        for cpu in [0x01000007, 0x0100000C]:
+            header += struct.pack(">IIIII", cpu, 0, 4096, 100, 0)
+        self.assertEqual(inspect_saved.executable_architectures(header), {"x86_64", "arm64"})
+        with self.assertRaises(ValueError):
+            inspect_saved.executable_architectures(header[:20])
+        self.assertEqual(inspect_saved.compiler_target("clang version 1\nTarget: arm64-apple-darwin25.0.0\n"),
+                         "arm64-apple-darwin25.0.0")
 
 
 class ScratchCase(unittest.TestCase):

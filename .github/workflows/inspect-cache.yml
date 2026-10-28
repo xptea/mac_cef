@@ -1,13 +1,31 @@
 name: Inspect existing CEF cache
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Free runner architecture for this read-only cache inspection.
+        type: choice
+        options: [arm64, intel]
+        default: arm64
+      checkpoint_key:
+        description: Exact checkpoint key; leave receipt fields blank for recovery.json.
+        type: string
+        default: ''
+      checkpoint_sha256:
+        description: Exact checkpoint archive checksum.
+        type: string
+        default: ''
+      checkpoint_recipe:
+        description: Exact checkpoint recipe checksum.
+        type: string
+        default: ''
 permissions:
   contents: read
 env:
   DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
 jobs:
   inspect:
-    runs-on: macos-26
+    runs-on: ${{ inputs.runner == 'intel' && 'macos-26-intel' || 'macos-26' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -15,11 +33,26 @@ jobs:
           persist-credentials: false
       - name: Load saved checkpoint key
         id: checkpoint
+        env:
+          CHECKPOINT_KEY: ${{ inputs.checkpoint_key }}
+          CHECKPOINT_SHA256: ${{ inputs.checkpoint_sha256 }}
+          CHECKPOINT_RECIPE: ${{ inputs.checkpoint_recipe }}
         run: |
           python3 - <<'PY'
-          import json, os
-          with open('recovery.json') as stream:
-              recovery=json.load(stream)
+          import json, os, re
+          key=os.environ['CHECKPOINT_KEY']
+          sha=os.environ['CHECKPOINT_SHA256']
+          recipe=os.environ['CHECKPOINT_RECIPE']
+          if not any([key,sha,recipe]):
+              with open('recovery.json') as stream:
+                  recovery=json.load(stream)
+          else:
+              assert re.fullmatch(r'cef-(?:proof|build)-v1-[0-9]+-[0-9]+', key), 'Invalid checkpoint key'
+              assert re.fullmatch(r'[0-9a-f]{64}', sha), 'Invalid checkpoint checksum'
+              assert re.fullmatch(r'[0-9a-f]{64}', recipe), 'Invalid checkpoint recipe'
+              recovery={'key':key, 'sha256':sha, 'recipe_sha256':recipe}
+          with open('checkpoint-inspection.json','w') as stream:
+              json.dump(recovery,stream)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
               stream.write('key=' + recovery['key'] + '\n')
           PY
@@ -29,4 +62,4 @@ jobs:
           key: ${{ steps.checkpoint.outputs.key }}
           fail-on-cache-miss: true
       - name: Check preserved data without source download or diagnostic upload
-        run: python3 scripts/inspect_saved.py
+        run: python3 scripts/inspect_saved.py --checkpoint-manifest checkpoint-inspection.json
