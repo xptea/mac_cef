@@ -82,7 +82,10 @@ def main():
         for binary in binaries:
             detail = subprocess.check_output(["file", str(binary)], text=True).strip()
             assert "Mach-O" in detail and "arm64" in detail, detail
-            subprocess.run(["otool", "-L", str(binary)], check=True)
+            # otool-classic interprets parentheses in helper names as archive-member syntax.
+            # file still validates every helper Mach-O; inspect load commands on the app/framework.
+            if "(" not in str(binary):
+                subprocess.run(["otool", "-L", str(binary)], check=True)
             print("PRESERVED_NATIVE_OUTPUT", json.dumps({"path": binary.relative_to(out).as_posix(),
                   "size": binary.stat().st_size, "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                   "file": detail}), flush=True)
