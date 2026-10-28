@@ -257,6 +257,21 @@ def require_clean_targets(ninja, out, targets, log):
         raise RuntimeError("Completed objects would rebuild. Inspect " + str(log) + "\n" + result.stdout[:7000] + "\n...\n" + result.stdout[-3000:])
 
 
+
+def compile_window_seconds(requested, deadline=None, now=None):
+    """Keep checkpoint time even when source preparation or Ninja planning is slow."""
+    if not 60 <= requested <= 19800:
+        raise RuntimeError("Compilation windows must be between 60 and 19800 seconds.")
+    if requested > 14400 and deadline is None:
+        raise RuntimeError("Compile windows over four hours require a job deadline.")
+    if deadline is not None:
+        now = time.time() if now is None else now
+        requested = min(requested, int(float(deadline) - now - 1200))
+        if requested < 60:
+            raise RuntimeError("Not enough job time remains for another compile window and safe checkpoint save.")
+    return requested
+
+
 def file_bytes(folder):
     return sum(p.stat().st_size for p in folder.rglob("*") if p.is_file() and not p.is_symlink())
 
@@ -602,16 +617,14 @@ class Probe:
         return self.src / "third_party/ninja/ninja"
 
     def compile(self, seconds):
-        if not 60 <= seconds <= 14400:
-            raise RuntimeError("Compilation windows must be between 60 and 14400 seconds.")
         deadline = os.environ.get("CEF_JOB_DEADLINE")
-        if deadline:
-            seconds = min(seconds, int(float(deadline) - time.time() - 1200))
-            if seconds < 60:
-                raise RuntimeError("Not enough job time remains for another compile window and safe checkpoint save.")
+        compile_window_seconds(seconds, deadline)
         if read_json(self.root / "identity.json")["recipe_sha256"] != digest(Path(__file__)):
             raise RuntimeError("Prepare the same recipe before compiling.")
         before = remaining_steps(self.ninja(), self.out, self.root / "remaining-before.log")
+        # Ninja planning also consumes job time. Recalculate immediately before
+        # launching the compiler so it cannot spend the checkpoint reserve.
+        seconds = compile_window_seconds(seconds, deadline)
         summary("CEF compile starting", {"remaining_build_steps": before, "window_seconds": seconds})
         result = self.run([self.ninja(), "-C", self.out, "-j", str(self.config["jobs"]), "cefclient"],
                           "partial-compile", timeout=seconds + 60, compile_seconds=seconds)

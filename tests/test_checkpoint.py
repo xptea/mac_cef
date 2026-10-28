@@ -16,6 +16,50 @@ import inspect_saved
 
 
 
+
+class CompileBudgetTests(unittest.TestCase):
+    def test_setup_time_reduces_compile_time_and_preserves_save_reserve(self):
+        job_start = 1000
+        soft_deadline = job_start + 350 * 60
+        hard_deadline = job_start + 360 * 60
+        for setup_minutes in [0, 30, 38, 90]:
+            now = job_start + setup_minutes * 60
+            window = proof.compile_window_seconds(19800, soft_deadline, now)
+            self.assertEqual(now + window, job_start + 330 * 60)
+            self.assertEqual(hard_deadline - (now + window), 30 * 60)
+        self.assertEqual(proof.compile_window_seconds(1200, soft_deadline, job_start), 1200)
+
+    def test_long_windows_require_a_deadline_and_expired_budget_is_rejected(self):
+        self.assertEqual(proof.compile_window_seconds(14400), 14400)
+        with self.assertRaisesRegex(RuntimeError, "require a job deadline"):
+            proof.compile_window_seconds(19800)
+        for seconds in [0, 59, 19801]:
+            with self.assertRaisesRegex(RuntimeError, "Compilation windows"):
+                proof.compile_window_seconds(seconds)
+        with self.assertRaisesRegex(RuntimeError, "Not enough job time"):
+            proof.compile_window_seconds(19800, 21000, 19741)
+
+    def test_ninja_planning_does_not_consume_the_checkpoint_reserve(self):
+        probe = proof.Probe.__new__(proof.Probe)
+        probe.root, probe.out = Path("unused-root"), Path("unused-output")
+        probe.config = {"jobs": 2}
+        probe.ninja = mock.Mock(return_value="ninja")
+        probe.run = mock.Mock(return_value={"bounded_stop": True})
+        with mock.patch.dict(os.environ, {"CEF_JOB_DEADLINE": "21000"}), \
+             mock.patch.object(proof.time, "time", side_effect=[1800, 2100]), \
+             mock.patch.object(proof, "digest", return_value="recipe"), \
+             mock.patch.object(proof, "read_json", return_value={"recipe_sha256": "recipe"}), \
+             mock.patch.object(proof, "remaining_steps", side_effect=[100, 90]), \
+             mock.patch.object(proof, "summary"), \
+             mock.patch.object(proof, "write_json"), \
+             mock.patch.object(proof, "ninja_outputs", return_value={}), \
+             mock.patch.object(proof, "samples_for", return_value=[]), \
+             mock.patch.object(proof, "require_clean_targets"):
+            probe.compile(19800)
+        self.assertEqual(probe.run.call_args.kwargs["compile_seconds"], 17700)
+        self.assertEqual(probe.run.call_args.kwargs["timeout"], 17760)
+
+
 class CachedArchitectureTests(unittest.TestCase):
     def test_native_program_architecture_without_executing_it(self):
         for cpu, arch in [(0x01000007, "x86_64"), (0x0100000C, "arm64")]:

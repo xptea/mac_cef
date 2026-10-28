@@ -35,15 +35,8 @@ jobs:
   build:
     name: Recover and continue the real cefclient engine target
     runs-on: macos-26
-    timeout-minutes: 330
+    timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-          architecture: arm64
       - name: Establish a checkpoint-safe job deadline
         env:
           BATCH: ${{ inputs.batch }}
@@ -52,9 +45,18 @@ jobs:
           import os, time
           batch=int(os.environ['BATCH'])
           assert 1 <= batch <= 12, 'Batch index must be between 1 and 12'
+          # Compilation reserves 20 minutes before this deadline; another
+          # 10 minutes remain before GitHub's six-hour hard timeout.
           with open(os.environ['GITHUB_ENV'], 'a') as stream:
-              stream.write('CEF_JOB_DEADLINE=' + str(time.time()+300*60) + '\n')
+              stream.write('CEF_JOB_DEADLINE=' + str(time.time()+350*60) + '\n')
           PY
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: arm64
       - name: Check recovery logic
         run: python3 -m unittest discover -s tests -v
       - name: Identify reusable prepared source
@@ -118,9 +120,9 @@ jobs:
         env:
           EXPECTED_CHECKPOINT_SHA256: ${{ steps.seed.outputs.sha256 }}
         run: python3 scripts/checkpoint.py verify --checkpoint-manifest checkpoint-seed.json --expected-sha256 "$EXPECTED_CHECKPOINT_SHA256"
-      - name: Continue compiling toward the full engine for up to four hours
+      - name: Continue compiling until the job reaches about five and a half hours
         id: compile
-        run: python3 scripts/checkpoint.py compile --seconds 14400
+        run: python3 scripts/checkpoint.py compile --seconds 19800
       - name: Save all completed work and the remaining-step count
         id: snapshot
         run: python3 scripts/checkpoint.py save
