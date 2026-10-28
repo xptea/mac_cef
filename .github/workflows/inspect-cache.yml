@@ -7,6 +7,10 @@ on:
         type: choice
         options: [arm64, intel]
         default: arm64
+      export_sdk:
+        description: Package a completed checkpoint as an SDK without rebuilding Chromium.
+        type: boolean
+        default: false
       checkpoint_key:
         description: Exact checkpoint key; leave receipt fields blank for recovery.json.
         type: string
@@ -20,13 +24,13 @@ on:
         type: string
         default: ''
 permissions:
-  contents: read
+  contents: write
 env:
   DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
 jobs:
   inspect:
     runs-on: ${{ inputs.runner == 'intel' && 'macos-26-intel' || 'macos-26' }}
-    timeout-minutes: 15
+    timeout-minutes: ${{ inputs.export_sdk && 90 || 15 }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -63,3 +67,12 @@ jobs:
           fail-on-cache-miss: true
       - name: Check preserved data without source download or diagnostic upload
         run: python3 scripts/inspect_saved.py --checkpoint-manifest checkpoint-inspection.json
+      - name: Package and validate completed Apple Silicon SDK
+        if: inputs.export_sdk && inputs.runner == 'arm64'
+        run: python3 scripts/export_sdk.py
+      - name: Stage SDK in an unpublished transfer draft
+        if: inputs.export_sdk && inputs.runner == 'arm64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "sdk-transfer-${GITHUB_RUN_ID}" sdk-export/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --title "Temporary Mac CEF SDK transfer" --notes "Unpublished SDK transfer for local integration. Remove after download."
